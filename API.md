@@ -222,10 +222,14 @@ POST /client-api/submit
 
 | 方法 | 路径 | 参数 | 说明 |
 |---|---|---|---|
-| GET | `/client-api/coin/balance` | — | 我的余额 |
-| GET | `/client-api/coin/bill` | `page, limit, all=1` | 账单（`all=1` 仅管理员） |
+| GET | `/client-api/coin/balance` | — | 我的余额。返回 `{uid, coin, coinAll, now, all}`（`coin`/`now` = 当前，`coinAll`/`all` = 累计获得） |
+| GET | `/client-api/coin/bill` | `page, limit, all=1` | 账单（`all=1` 仅管理员）。`bills[]` 每项 `{id, uid, userId, rootId, amount, note, text, at}`；`at` 常为 `null` —— coin-33oj 的账单没有时间字段，时间在 ObjectId 前 8 位里 |
 | GET | `/client-api/coin/rank` | `limit` | 硬币排行 |
 | POST | `/client-api/coin/inc` | `uid, amount, note` | **管理员**发硬币 |
+
+> ⚠️ 余额读的是站点硬币插件的字段（默认 `user.coin_now` / `user.coin_all`），
+> 账单读的是它那张集合（默认 `coin`）。**别用网页抓取取这几个数** ——
+> 2026-10-11 实测客户端的 HTML 正则拿到的是 0，而这里返回的是 952。
 
 ---
 

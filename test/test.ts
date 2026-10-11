@@ -103,6 +103,8 @@ function makeDB() {
                 async countDocuments(q: any) {
                     return c.docs.filter((d) => match(d, q || {})).length;
                 },
+                // diagnose 用它试探「这个集合在不在、有多少条」
+                async estimatedDocumentCount() { return c.docs.length; },
             };
         },
         // diagnose 靠它列集合清单
@@ -140,7 +142,10 @@ const CFG = {
     ],
     makeupCost: 5, makeupWindow: 3, makeupReward: 0,
     coinEnabled: true,
-    coinUserCollection: 'user', coinUserField: 'coin', coinBillCollection: 'coin.bill',
+    // ⚠️ 这几个默认值 = 站点上 coin-33oj 的**真实结构**（2026-10-11 对着它源码核过）：
+    //    账单集合叫 `coin`（不是 `coin.bill`），文档形如 {userId, rootId, amount, text}。
+    coinUserCollection: 'user', coinUserField: 'coin_now', coinAllField: 'coin_all',
+    coinBillCollection: 'coin',
     checkinCollection: 'clientgw.checkin', checkinLogCollection: 'clientgw.checkin_log',
     tokenCollection: 'clientgw.token', pairCollection: 'clientgw.pair',
     tokenTtlDays: 365,
@@ -151,7 +156,7 @@ async function main() {
     // 预置用户：真实环境下 uid 一定存在（他得先登录才能签到），
     // 而且硬币就写在用户文档的这个字段上。
     for (const uid of [5, 7, 100, 101, 102, 103, 104]) {
-        await db.collection('user').insertOne({ _id: uid, uname: `u${uid}`, coin: 0 });
+        await db.collection('user').insertOne({ _id: uid, uname: `u${uid}`, coin_now: 0, coin_all: 0 });
     }
 
     section('1. 时间（固定 Asia/Shanghai）');
@@ -202,10 +207,17 @@ async function main() {
 
     section('6. 发硬币（对接 coin-33oj 的字段）');
     const u2 = await db.collection('user').findOne({ _id: U2 });
-    eq('U2 硬币 = 7 基础 + 2 + 5', u2.coin, 14);
-    const bills = (await db.collection('coin.bill').find({}).toArray()).filter((b: any) => b.uid === U2);
+    eq('U2 硬币 = 7 基础 + 2 + 5', u2.coin_now, 14);
+    // 累计获得也要跟着涨 —— 站点硬币榜是 find({coin_all:{$exists:true}}) 筛出来的
+    eq('U2 累计获得', u2.coin_all, 14);
+    // ⭐ 账单必须落在**站点插件读的那个集合**里，字段也要对得上，
+    //    否则签到发的币在站点流水里根本不出现（2026-10-11 的线上事故）。
+    const bills = (await db.collection('coin').find({}).toArray()).filter((b: any) => b.userId === U2);
     eq('U2 账单条数', bills.length, 7);
     eq('账单金额合计', bills.reduce((s: number, b: any) => s + b.amount, 0), 14);
+    check('账单字段是站点形状 {userId,rootId,amount,text}',
+        bills.every((b: any) => 'userId' in b && 'rootId' in b && 'amount' in b && 'text' in b),
+        JSON.stringify(bills[0]));
     eq('coinBalance 读到同一个数', await coinBalance(U2), 14);
 
     section('7. 并发签到（幂等的物理保证）★');
@@ -216,7 +228,7 @@ async function main() {
     ]);
     eq('两个并发只有 1 个真签到', [a, b].filter((x) => !x.already).length, 1);
     const u3 = await db.collection('user').findOne({ _id: U3 });
-    eq('并发下只发了一次硬币', u3 ? u3.coin : 0, 1);
+    eq('并发下只发了一次硬币', u3 ? u3.coin_now : 0, 1);
     eq('并发下流水只有 1 条', (await db.collection('clientgw.checkin_log').find({ uid: U3 }).toArray()).length, 1);
 
     section('8. 补签');
@@ -285,26 +297,66 @@ async function main() {
     const before = await coinBalance(104);
     await grantCoin(104, 30, '测试发放');
     eq('正常发币生效', await coinBalance(104), before + 30);
-    eq('发币后账单多一条', (await db.collection('coin.bill').find({ uid: 104 }).toArray()).length, 1);
+    eq('发币后账单多一条', (await db.collection('coin').find({ userId: 104 }).toArray()).length, 1);
 
     section('15. 自检诊断（硬币字段配错能不能发现）★');
     const dg = await diagnose(101);
     check('诊断跑通', !!dg.summary, dg.summary);
     eq('认出了硬币字段', dg.coin.fieldExists, true);
     eq('读到余额', dg.coin.sampleValue, 14);
-    check('列出了数字字段', dg.coin.numericFields.includes('coin'), JSON.stringify(dg.coin.numericFields));
+    check('列出了数字字段', dg.coin.numericFields.includes('coin_now'), JSON.stringify(dg.coin.numericFields));
     check('配置正确时无误报', dg.issues.length === 0, JSON.stringify(dg.issues));
     eq('账单集合也在库里', dg.coin.billCollectionExists, true);
+    check('自检报出账单真实字段名', dg.coin.billFields.includes('userId') && dg.coin.billFields.includes('text'),
+        JSON.stringify(dg.coin.billFields));
 
     // ⭐ 把字段配错，诊断必须发现并给出建议（否则装上后会静默丢币）
     init({ db } as any, { ...CFG, coinUserField: 'totally_wrong_field' });
     const dg2 = await diagnose(101);
     check('字段配错会被发现', dg2.issues.some((i) => /读不到/.test(i)), JSON.stringify(dg2.issues));
-    eq('给出建议字段名', dg2.coin.suggestedField, 'coin');
+    eq('给出建议字段名', dg2.coin.suggestedField, 'coin_now');
     check('summary 点出有问题', /要确认/.test(dg2.summary), dg2.summary);
 
     // 恢复正确配置
     init({ db } as any, CFG);
+
+    section('16. 优先走站点硬币插件的 inc()（避免写错集合/字段）★');
+    {
+        const calls: any[] = [];
+        // 模拟 coin-33oj：4 参 inc(userId, rootId, amount, text)，内部写账单 + 涨两个字段
+        (globalThis as any).Hydro = {
+            model: {
+                coin: {
+                    async inc(userId: number, rootId: number, amount: number, text: string) {
+                        calls.push([userId, rootId, amount, text]);
+                        await db.collection('coin').insertOne({ userId, rootId, amount, text });
+                        await db.collection('user').updateOne(
+                            { _id: userId }, { $inc: { coin_now: amount, coin_all: amount } },
+                        );
+                    },
+                },
+            },
+        };
+        const U9 = 106;
+        await db.collection('user').insertOne({ _id: U9, uname: 'u106', coin_now: 0, coin_all: 0 });
+        await grantCoin(U9, 7, '走站点 inc');
+        eq('调用了站点 inc 一次', calls.length, 1);
+        eq('参数是 (uid, rootId=0, amount, text)', calls[0], [U9, 0, 7, '走站点 inc']);
+        const u9 = await db.collection('user').findOne({ _id: U9 });
+        eq('余额由站点 inc 维护', u9.coin_now, 7);
+        eq('账单没被重复记一条', (await db.collection('coin').find({ userId: U9 }).toArray()).length, 1);
+
+        // ⭐ 参数个数不是 4 → 不敢调（照 4 参传会把金额塞到 rootId 上，比不调还糟）
+        (globalThis as any).Hydro = {
+            model: { coin: { async inc(a: any, b: any, c: any) { calls.push(['WRONG', a, b, c]); } } },
+        };
+        const U10 = 107;
+        await db.collection('user').insertOne({ _id: U10, uname: 'u107', coin_now: 0, coin_all: 0 });
+        await grantCoin(U10, 3, '三参不敢调');
+        eq('参不上时退回自己写库', (await db.collection('user').findOne({ _id: U10 })).coin_now, 3);
+        check('没有误调三参 inc', !calls.some((c) => c[0] === 'WRONG'), JSON.stringify(calls));
+        (globalThis as any).Hydro = undefined;
+    }
 
     console.log(`\n${'='.repeat(46)}`);
     console.log(`结果：通过 ${pass}　失败 ${fail}`);

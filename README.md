@@ -12,7 +12,9 @@
 
 1. **人机验证**：登录/提交一旦加验证码，客户端直接失效；
 2. **抓页面很脆**：网页改一次类名/结构，客户端就得跟着改一版；
-3. **拿不到完整数据**：余额这种数字得从 HTML 里抠（现在就是靠正则找 `"coin_now":275`）。
+3. **拿不到完整数据**：余额这种数字得从 HTML 里抠 —— 而且**真的会抠不到**。
+   2026-10-11 实测：客户端硬币页的正则 `"coin_now":(\d+)` 拿到的是 `0`，
+   而同一时刻通道接口返回的余额是 `952`。同类问题还有「累计获得」也在同一次请求里一起变 0。
 
 插件给客户端开一套**稳定的 JSON 接口**，上面三个问题一起消掉 —— 顺带把「签到」这种新功能做进去。
 
@@ -142,23 +144,39 @@ Authorization: Bearer <token>
 
 ## 五、对接硬币（⚠️ 装完请确认这一节）
 
-发硬币这件事**必须按你服务器上装的那个硬币插件来调**。你这套装的是 **`coin-33oj`**（33OJ 那套），它的做法是：
+发硬币这件事**必须按你服务器上装的那个硬币插件来调**。你这套装的是 **`coin-33oj`**（33OJ 那套）。它的真实结构（2026-10-11 对着 `open33oj/hydro-plugins` 的 `coin-33oj/index.ts` 源码 + 线上自检**逐项核对过**）：
 
-- **余额**：用户文档上一个数字字段 —— **SanhaiOJ 上是 `coin_now`**（已由自检实测确认，也是默认值）
-- **流水**：一张账单集合 —— 默认假设叫 `coin.bill`，**但这一点还没确认**（见下）
+- **余额**：用户文档上的 `coin_now`（当前）/ `coin_all`（累计获得）
+- **流水**：账单集合 —— 名字就叫 **`coin`**（`db.collection('coin')`）
+- **账单文档形状**：`{ userId, rootId, amount, text }`，**没有时间字段**（时间藏在 ObjectId 前 8 位里）
+
+> ⚠️⚠️ **踩过的坑（2026-10-11 线上事故）**：这套插件最早的默认值把账单写进了
+> `coin.bill` 集合、字段写 `{uid, amount, note}` —— 而站点插件读的是 `coin` 集合、
+> 字段是 `{userId, rootId, amount, text}`。两边对不上的后果是：
+> **签到发的币在站点流水里完全不出现**（余额却是对的，因为 `coin_now` 两边一致），
+> 而且 `coin_all`（累计获得）从来没涨过 —— 站点硬币榜是
+> `find({coin_all:{$exists:true}})` 筛出来的，所以这些用户在硬币榜上**是隐形的**。
+>
+> 现在的做法是**优先直接调用站点插件自己的 `inc()`**（coin-33oj 在 `apply()` 里做了
+> `global.Hydro.model.coin = coinModel`），账单 + `coin_now` + `coin_all` 一次到位、
+> 集合与字段名都不用猜；拿不到那个模型时才退回自己写库。
 
 ### 怎么确认（别猜，猜错不会报错）
 
 **装完先看启动日志**，插件自己会查一遍：
 
 ```
-[clientgw] 自检：有 2 处配置要确认
-[clientgw] 待确认：硬币字段 user.coin_now 读不到 —— 发币会失败，检查 coinUserField
-[clientgw] 待确认：账单集合 coin.bill 不在库里 —— 检查 coinBillCollection
-[clientgw] 库里现有的集合（找一个像账单的填进 coinBillCollection）：user、record、oplog、...
+[clientgw] 自检：配置正常（user.coin_now = 952，账单 coin 1234 条（字段 _id、userId、rootId、amount、text），发币走 站点 coin 插件）
+[clientgw] 发币将直接调用站点硬币插件的 inc()（账单与 coin_all 交给它维护）
 ```
 
-最后那行会把**库里所有集合名列出来** —— 里面哪个像账单就填进 `coinBillCollection`。
+出问题时是这样：
+
+```
+[clientgw] 自检：有 1 处配置要确认
+[clientgw] 待确认：账单集合 coin.bill 读不出来（要么名字不对、要么没权限）
+[clientgw] 建议把 coinBillCollection 改成 `coin`
+```
 
 也可以自己查（数据库名一般是 `hydro`）：
 
@@ -166,25 +184,25 @@ Authorization: Bearer <token>
 # 1) 用户文档上到底有没有硬币字段、叫什么
 mongosh hydro --eval 'printjson(db.user.findOne({_id: 5}))'
 
-# 2) 列出所有集合（注意：**不要只筛 /coin/i** —— SanhaiOJ 上没有一个集合名含 coin，
-#    所以账单表要么叫别的名字，要么根本不存在，得看全量清单）
-mongosh hydro --eval 'printjson(db.getCollectionNames())'
+# 2) 看账单集合的真实名字和字段（⭐ 这一步就能定死，别靠猜）
+mongosh hydro --eval 'printjson(db.coin.findOne({}))'
 ```
 
-### 对应的三个配置项
+### 对应的配置项
 
 | 配置 | 默认 | 说明 |
 |---|---|---|
-| `coinUserField` | `coin_now` | 用户文档上记余额的字段名 |
+| `coinUserField` | `coin_now` | 用户文档上记**当前**余额的字段名 |
+| `coinAllField` | `coin_all` | 记**累计获得**的字段名（站点硬币榜按它筛人） |
 | `coinUserCollection` | `user` | 余额存在哪个集合（一般不用改） |
-| `coinBillCollection` | `coin.bill` | 账单集合名；**写出错不会影响发币**（余额已经加上） |
+| `coinBillCollection` | `coin` | 账单集合名 |
 | `coinWriteBill` | `true` | 关掉 = 只加余额、不写账单表 |
 
 改完不用重启（Hydro 会热重载设置）。
 
-> ⚠️ 如果账单表名一直配不对，**不会丢币**：余额是直接 `$inc` 到用户文档上的，
-> 账单写入失败只会在日志里留一条 warn。真正会因为配错而**静默失败的是字段名**
-> —— 所以自检优先盯的是 `coinUserField`。
+> ⚠️ 字段名配错是**静默失败**：MongoDB 的 `updateOne` 匹配不到就当没这回事，
+> 硬币会**无声无息地消失**。所以自检优先盯的就是字段名 —— 它会从用户文档里
+> 把「像硬币的字段」列出来提醒你核对。
 
 > 也可以直接调用 coin-33oj 自己的入口对比一下：`/coin/inc`（管理员加币）、`/coin/bill`（账单）。
 

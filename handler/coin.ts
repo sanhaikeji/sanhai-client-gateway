@@ -2,20 +2,22 @@
  * 硬币接口。
  *
  * ⚠️ 这里读的是 **coin-33oj 那套结构**（你服务器上装的那个）：
- *   - 余额：用户文档上一个数字字段（默认 `user.coin`）
- *   - 流水：一张账单集合（默认 `coin.bill`）
- * 字段名不对的话，改 `index.ts` 里的 `coinUserField` / `coinBillCollection` 即可 ——
- * README 的「对接硬币」一节有一条 mongosh 命令，能一眼看出真实的字段名。
+ *   - 余额：用户文档上的数字字段 `coin_now`（当前）/ `coin_all`（累计获得）
+ *   - 流水：账单集合 **`coin`**（不是 `coin.bill`！），字段 `{userId, rootId, amount, text}`
+ * 字段名不对的话，改 `index.ts` 里的配置即可 —— 启动日志 / `/client-api/diagnose`
+ * 会直接把库里真实的集合名和字段名打出来。
  *
  * 「加币」接口只给管理员用（默认 uid 5，可在配置里改），普通用户只有只读的余额/流水/排行。
  */
 import { ClientApiHandler } from './base';
-import { coinBalance, grantCoin, getConfig } from '../model';
+import { coinBalance, coinBalances, grantCoin, getConfig } from '../model';
 
 export class CoinBalanceHandler extends ClientApiHandler {
     protected async run() {
-        const bal = await coinBalance(this.clientUid);
-        this.ok({ uid: this.clientUid, coin: bal });
+        // 2026-10-11：把「累计获得」也一起返回 —— 客户端硬币页要显示两个数，
+        // 以前它只能去抓网页 HTML，那条路已经拿不到数了（见 README 的排查记录）。
+        const b = await coinBalances(this.clientUid);
+        this.ok({ uid: this.clientUid, coin: b.now, coinAll: b.all, now: b.now, all: b.all });
     }
 }
 
@@ -28,20 +30,28 @@ export class CoinBillHandler extends ClientApiHandler {
         // 管理员（或配置里的人）可以看全部人的账单
         const all = String(this.param('all', '0')) === '1' && isAdmin(cfg, this.clientUid);
 
+        // ⚠️ 站点插件写的是 `userId`，我们早期版本写的是 `uid`。两个都认，
+        //    否则历史流水会突然「消失」。
+        const q = all ? {} : { $or: [{ userId: this.clientUid }, { uid: this.clientUid }] };
+
         let docs: any[] = [];
         try {
-            const q = all ? {} : { uid: this.clientUid };
-            docs = await ctx.db.collection(cfg.coinBillCollection || 'coin.bill')
-                .find(q).sort({ ts: -1, _id: -1 }).skip((page - 1) * limit).limit(limit).toArray();
+            docs = await ctx.db.collection(cfg.coinBillCollection || 'coin')
+                .find(q).sort({ _id: -1 }).skip((page - 1) * limit).limit(limit).toArray();
         } catch { /* 集合不存在就当空 */ }
 
         this.ok({
             page, limit, scope: all ? 'all' : 'mine',
             bills: docs.map((d: any) => ({
                 id: String(d._id),
-                uid: d.uid,
+                uid: d.userId ?? d.uid ?? 0,
+                userId: d.userId ?? d.uid ?? 0,
+                rootId: d.rootId ?? 0,
                 amount: d.amount,
-                note: d.note || '',
+                // 站点插件叫 text，我们早期版本叫 note
+                note: d.text || d.note || '',
+                text: d.text || d.note || '',
+                // 站点插件的账单**没有时间字段**，时间藏在 ObjectId 前 8 位里（客户端自己反推）
                 at: d.ts || null,
             })),
         });

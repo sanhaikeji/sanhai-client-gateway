@@ -332,23 +332,81 @@ export async function recentLogs(uid: number, limit = 30) {
 // ---------------------------------------------------------------- 硬币发放（对接 coin-33oj）
 
 /**
- * 发硬币。
+ * 站点硬币插件自己注册的「发币」入口。
  *
- * ⚠️ **这一处必须按你服务器上装的那个硬币插件来调**。33OJ 那套 `coin-33oj` 的做法是
- * 「用户文档上一个记数量的字段 + 一张账单表」，所以这里默认直接写库；
- * 换成别的硬币插件时，改 index.ts 的配置即可（或在这里加一个分支）。
+ * <para>⭐ 为什么优先走它、而不是自己写库：<b>我们自己写库会写错地方</b>。
+ * coin-33oj（以及它的各个改版）在 <c>apply()</c> 里做了
+ * <c>global.Hydro.model.coin = coinModel</c>，把 <c>inc(userId, rootId, amount, text)</c>
+ * 暴露出来 —— 它内部干三件事：写账单、<c>$inc coin_now</c>、正数时再 <c>$inc coin_all</c>。</para>
  *
- * 怎么确认字段名：见 README「对接硬币」一节（一条 mongosh 命令就能看出来）。
+ * <para>⚠️ 2026-10-11 的线上事故就是这么来的：我们自己 <c>insertOne</c> 到 <c>coin.bill</c>、
+ * 字段写 <c>{uid, amount, note}</c>，而站点插件读的是 <c>coin</c> 集合、字段是
+ * <c>{userId, rootId, amount, text}</c> —— <b>两边对不上，于是签到发的币在流水里根本不出现</b>
+ * （余额倒是对的，因为 coin_now 两边一致），而且 <c>coin_all</c>（累计获得）从来没涨过。</para>
+ *
+ * <para>拿到它就等于「和站点插件用同一套账」，集合名/字段名/连带字段全都不用猜。</para>
+ */
+function siteCoinModel(): any {
+    const g: any = (globalThis as any).Hydro;
+    return g?.model?.coin;
+}
+
+/**
+ * 站点那个 `inc` 能不能按 `inc(uid, rootId, amount, text)` 调。
+ *
+ * <para>⚠️ **必须看参数个数**：coin-33oj 原版是 4 参（uid / rootId / amount / text）。
+ * 万一某个改版砍成 3 参，照 4 参传就会**把金额塞到 rootId 的位置上** ——
+ * 那比不调还糟（发出去 0 个币，还记了一笔错账）。对不上就老实走下面自己写库那一支，
+ * 效果一样（coin-33oj 的 `inc` 内部也就是 insertOne + 两个 $inc）。</para>
+ */
+function canCallSiteInc(coin: any): boolean {
+    return !!coin && typeof coin.inc === 'function' && coin.inc.length >= 4;
+}
+
+/**
+ * 发硬币。优先调站点硬币插件自己的 {@link siteCoinModel}；拿不到再自己写库兜底。
+ *
+ * ⚠️ 兜底那一支必须按服务器上装的那个硬币插件来调（集合名 + 字段名）。
+ * 怎么确认：看启动日志/`/client-api/diagnose` 的「账单」一节 —— 它会把库里
+ * 真实存在的账单集合和它的字段名打出来，别猜。
  */
 export async function grantCoin(uid: number, amount: number, note: string) {
     const c = ctx();
     const userColl = c.db.collection(cfg.coinUserCollection || 'user');
     const field = cfg.coinUserField || 'coin_now';
-    const r = await userColl.updateOne({ _id: uid }, { $inc: { [field]: amount } });
+    const allField = cfg.coinAllField || 'coin_all';
 
-    // ⚠️ 匹配不到用户时 updateOne **不报错**，只是 matchedCount = 0 —— 硬币会**静默消失**。
-    //    最常见的触发原因就是硬币字段名配错了（拿不到就查不到，见 README 第五节）。
-    //    所以这里必须显式检查并抛错，让调用方知道「这次没发出去」。
+    // 先确认这个 uid 真的存在。⚠️ 理由和下面 updateOne 的检查一样：
+    // 匹配不到用户时一切写库都**不报错**，硬币会**静默消失**（coin.inc 内部也是 updateOne）。
+    const udoc = await userColl.findOne({ _id: uid }, { projection: { _id: 1 } });
+    if (!udoc) {
+        throw new Error(
+            `发硬币失败：${cfg.coinUserCollection || 'user'} 里没有 uid=${uid}`,
+        );
+    }
+
+    // ① 首选：站点硬币插件自己的发币函数（账单 + coin_now + coin_all 一次到位）。
+    const coin = siteCoinModel();
+    if (canCallSiteInc(coin)) {
+        try {
+            // rootId = 0 表示「系统发放」；站点插件的账单页会把它显示成发放人 uid。
+            await coin.inc(uid, 0, amount, note);
+            return;
+        } catch (e) {
+            // 兜底写库有重复记账的风险（账单可能已经写进去了），所以这条日志要看。
+            ctx().logger?.warn?.(
+                `[clientgw] 调站点 coin.inc 失败，改用直接写库（可能重复记一笔账单）：${(e as Error).message}`,
+            );
+        }
+    } else if (coin && typeof coin.inc === 'function') {
+        ctx().logger?.warn?.(
+            `[clientgw] 站点 coin.inc 的参数个数是 ${coin.inc.length}（不是 4），不敢按 `
+            + 'inc(uid, rootId, amount, text) 调，改用直接写库',
+        );
+    }
+
+    // ② 兜底：自己写。字段名/集合名以 cfg 为准。
+    const r = await userColl.updateOne({ _id: uid }, { $inc: { [field]: amount } });
     if (!r || !r.matchedCount) {
         throw new Error(
             `发硬币失败：${cfg.coinUserCollection || 'user'} 里没有 uid=${uid}，`
@@ -356,12 +414,22 @@ export async function grantCoin(uid: number, amount: number, note: string) {
         );
     }
 
+    // ⚠️ 累计获得要一起涨。站点硬币榜单是 `find({ coin_all: { $exists: true } })` 筛出来的
+    //    —— 只涨 coin_now 不涨 coin_all 的用户，**在硬币榜上是看不见的**。
+    if (amount > 0) {
+        try {
+            await userColl.updateOne({ _id: uid }, { $inc: { [allField]: amount } });
+        } catch (e) {
+            ctx().logger?.warn?.(`[clientgw] 累加 ${allField} 失败（不影响本次发币）：${(e as Error).message}`);
+        }
+    }
+
     // 账单（流水）—— **尽力而为**：余额上面已经加上了，这里失败不该让调用方以为「没发出去」。
-    // 名字配错最多多一个空集合，不会丢币；不想要这张表就把 coinWriteBill 关掉。
+    // 字段名按站点插件（coin-33oj）的形状写，这样站点账单页也能正常渲染。
     if (cfg.coinWriteBill !== false) {
         try {
-            await c.db.collection(cfg.coinBillCollection || 'coin.bill').insertOne({
-                uid, amount, note, ts: new Date(),
+            await c.db.collection(cfg.coinBillCollection || 'coin').insertOne({
+                userId: uid, rootId: 0, amount, text: note, ts: new Date(),
             });
         } catch (e) {
             ctx().logger?.warn?.(`[clientgw] 写硬币账单失败（余额已加，不影响发币）：${(e as Error).message}`);
@@ -369,14 +437,24 @@ export async function grantCoin(uid: number, amount: number, note: string) {
     }
 }
 
-/** 读余额（同样按上面的假设）。 */
+/** 读余额：`coin_now`（当前）+ `coin_all`（累计获得）。 */
 export async function coinBalance(uid: number): Promise<number> {
+    const b = await coinBalances(uid);
+    return b.now;
+}
+
+/** 当前 / 累计两个数（客户端硬币页要一起显示）。 */
+export async function coinBalances(uid: number): Promise<{ now: number; all: number }> {
     const c = ctx();
-    const field = cfg.coinUserField || 'coin_now';
+    const nowField = cfg.coinUserField || 'coin_now';
+    const allField = cfg.coinAllField || 'coin_all';
     const d = await c.db.collection(cfg.coinUserCollection || 'user').findOne(
-        { _id: uid }, { projection: { [field]: 1 } },
+        { _id: uid }, { projection: { [nowField]: 1, [allField]: 1 } },
     );
-    return (d && Number(d[field])) || 0;
+    return {
+        now: (d && Number(d[nowField])) || 0,
+        all: (d && Number(d[allField])) || 0,
+    };
 }
 
 // ---------------------------------------------------------------- 自检
@@ -393,6 +471,10 @@ export interface DiagnoseResult {
         billCollection: string;
         billCollectionExists: boolean;
         billCount: number;
+        /** 账单文档里真实出现的字段名（拿它对齐读写，别猜）。 */
+        billFields: string[];
+        /** 站点硬币插件有没有把 `inc` 挂到 global.Hydro.model.coin 上（挂了就优先用它发币）。 */
+        siteCoinModel: boolean;
         suggestedField: string | null;
         suggestedBillCollection: string | null;
     };
@@ -431,38 +513,75 @@ export async function diagnose(uid?: number): Promise<DiagnoseResult> {
         issues.push(`读 ${uColl} 失败：${(e as Error).message}`);
     }
 
-    // ---- 集合清单（顺便找出像账单的那个）----
+    // ---- 集合清单 ----
+    // ⚠️ `listCollections()` 在受限的 Mongo 账号下会**直接抛错**（缺 listCollections 权限），
+    //    不是一个可以信赖的依据 —— 2026-10-11 就是这么误报「账单集合 coin.bill 不在库里」的：
+    //    实际上表在、还有数据，只是清单读不出来。
+    //    所以这里改成：清单只当参考，真正的判断靠「按名字去试探」。
     let collections: string[] = [];
     try {
         const all = await c.db.listCollections().toArray();
         collections = all.map((x: any) => x.name);
-    } catch { /* 有些权限读不到清单，不影响主判断 */ }
+    } catch { /* 权限不够读不到清单，正常 —— 下面的试探才是主路径 */ }
 
-    const billColl = cfg.coinBillCollection || 'coin.bill';
-    const billCollectionExists = collections.includes(billColl);
+    const billColl = cfg.coinBillCollection || 'coin';
+    let billCollectionExists = false;
     let billCount = 0;
-    if (billCollectionExists) {
-        try { billCount = await c.db.collection(billColl).countDocuments({}); } catch { /* 忽略 */ }
+    try {
+        billCount = await c.db.collection(billColl).estimatedDocumentCount();
+        billCollectionExists = true;
+    } catch { /* 集合不存在 / 读不到 */ }
+
+    // 「像账单的集合」——按候选名逐个试探（Mongo 里 collection 不存在时 count 会返回 0 而不是报错，
+    // 所以判断依据取「有文档」）。命中就把**真实字段名**读出来，这是唯一能确定 schema 的办法。
+    const candidates = [
+        billColl, 'coin', 'coin.bill', 'coin_bill', 'coinbill', 'coin.log', 'coin.logs',
+    ].filter((n, i, a) => n && a.indexOf(n) === i);
+    let suggestedBillCollection: string | null = null;
+    let billFields: string[] = [];
+    let billSampleCount = 0;
+    for (const name of candidates) {
+        try {
+            const n = await c.db.collection(name).estimatedDocumentCount();
+            if (n <= 0) continue;
+            if (!billFields.length) {
+                const one = await c.db.collection(name).findOne({});
+                if (one) {
+                    billFields = Object.keys(one);
+                    billSampleCount = n;
+                    if (name !== billColl) suggestedBillCollection = name;
+                }
+            }
+        } catch { /* 忽略 */ }
     }
-
-    // ⭐ 给出建议：名字里带 coin/money/score 的字段、含 coin 的集合
+    // ⭐ 给出建议：名字里带 coin/money/score 的字段。
+    // ⚠️ 优先挑「当前余额」味道的（`coin_now` 这种）—— 用户文档上同时有 coin_now / coin_all，
+    //    按「第一个像硬币的」挑可能挑到 coin_all（累计获得），那会把配置**改错**。
     const guessWords = ['coin', 'coins', 'money', 'score', 'point', 'points'];
-    const suggestedField = numericFields.find((k) => guessWords.some((w) => k.toLowerCase().includes(w))) || null;
-    const suggestedBillCollection = collections.find((n) => /coin/i.test(n) && n !== uColl) || null;
+    const coinish = numericFields.filter((k) => guessWords.some((w) => k.toLowerCase().includes(w)));
+    const suggestedField = coinish.find((k) => /(^|_)now$/i.test(k))
+        || coinish.find((k) => !/(^|_)all$/i.test(k))
+        || coinish[0]
+        || null;
 
-    if (!fieldExists) issues.push(`硬币字段 ${uColl}.${field} 读不到 —— 发币会失败，检查 coinUserField`);
-    if (!billCollectionExists) issues.push(`账单集合 ${billColl} 不在库里 —— 检查 coinBillCollection`);
+    if (!fieldExists) {
+        issues.push(`硬币字段 ${uColl}.${field} 读不到 —— 发币会失败，检查 coinUserField`);
+    }
+    if (!billCollectionExists) {
+        // 这里要说清「表不存在」和「权限读不到」是两回事，否则会像 2026-10-11 那样白排查一轮。
+        issues.push(
+            `账单集合 ${billColl} 读不出来（要么名字不对、要么没权限）`
+            + (collections.length ? '' : '；注意集合清单也读不到，本机的 Mongo 账号可能缺 listCollections 权限'),
+        );
+    }
     if (fieldExists && suggestedField && suggestedField !== field) {
         issues.push(`${uColl} 上还有个像硬币的字段 \`${suggestedField}\`，确认哪个才是余额`);
     }
-    if (!billCollectionExists && suggestedBillCollection) {
-        issues.push(`发现一个更像账单的集合 \`${suggestedBillCollection}\``);
-    }
-    if (collections.length) {
-        const coinish = collections.filter((n) => /coin/i.test(n));
-        if (coinish.length && !coinish.includes(billColl)) {
-            issues.push(`库里含 coin 的集合有：${coinish.join('、')}`);
-        }
+    if (suggestedBillCollection) {
+        issues.push(
+            `发现一个更像账单的集合 \`${suggestedBillCollection}\``
+            + `（${billSampleCount} 条，字段：${billFields.join('、')}）`,
+        );
     }
 
     // ---- 签到自己的表 ----
@@ -471,15 +590,20 @@ export async function diagnose(uid?: number): Promise<DiagnoseResult> {
         logCount = await c.db.collection(cfg.checkinLogCollection || 'clientgw.checkin_log').countDocuments({});
     } catch { /* 第一次装还没有这张表，正常 */ }
 
+    const siteCoin = canCallSiteInc(siteCoinModel());
+
     const summary = issues.length
         ? `有 ${issues.length} 处配置要确认`
-        : `配置正常（${uColl}.${field}${sampleValue === null ? '' : ` = ${sampleValue}`}，账单 ${billColl} ${billCount} 条）`;
+        : `配置正常（${uColl}.${field}${sampleValue === null ? '' : ` = ${sampleValue}`}`
+          + `，账单 ${billColl} ${billCount} 条${billFields.length ? `（字段 ${billFields.join('、')}）` : ''}`
+          + `，发币走 ${siteCoin ? '站点 coin 插件' : '自写库兜底'}）`;
 
     return {
         summary, issues,
         coin: {
             userCollection: uColl, userField: field, fieldExists, sampleValue, numericFields,
             billCollection: billColl, billCollectionExists, billCount,
+            billFields, siteCoinModel: siteCoin,
             suggestedField, suggestedBillCollection,
         },
         checkin: {
