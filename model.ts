@@ -4,8 +4,8 @@
  * 设计上只依赖 `ctx.db`（MongoDB），不碰 Hydro 的核心模型 —— 这样跨 Hydro 版本
  * 的兼容面最大（升级 Hydro 不用跟着改这里）。
  */
+import { ObjectId } from 'hydrooj';   // 见 index.ts 顶部注释：别直接 import 'mongodb'
 import type { Context } from 'hydrooj';
-import { ObjectId } from 'mongodb';
 import {
     today, prevDay, newToken, hashToken, newPairCode,
 } from './lib';

@@ -6,7 +6,10 @@
  * 想漏也漏不掉。
  */
 import { Handler } from 'hydrooj';
-import { verifyToken, TokenInfo } from '../model';
+// ⚠️ TokenInfo 是 **interface**（编译后不存在），必须用 `import type` ——
+//    当成值导入的话，ESM 下会直接 SyntaxError：does not provide an export named 'TokenInfo'。
+import { verifyToken } from '../model';
+import type { TokenInfo } from '../model';
 import { rateLimit } from '../lib';
 
 export abstract class ClientApiHandler extends Handler {

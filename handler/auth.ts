@@ -8,7 +8,7 @@
  *
  * 两种都返回同一个东西：一个长期令牌字符串。之后所有接口都用它。
  */
-import { Handler, PRIV, UserModel, User } from 'hydrooj';
+import { Handler, PRIV, UserModel } from 'hydrooj';
 import { ClientApiHandler } from './base';
 import {
     issueToken, issuePairCode, consumePairCode, listTokens, revokeTokens,
@@ -38,13 +38,26 @@ async function findUser(key: string) {
     return null;
 }
 
-/** 校验密码。同样做多版本兼容。 */
+/**
+ * 校验密码。多版本兼容。
+ *
+ * <para>⚠️ 别 `import { User } from 'hydrooj'` —— **hydrooj 并不导出 `User` 这个类**
+ * （只导出 `UserModel`）。写 `new User(udoc)` 在 CJS 下会变成 `new undefined(...)`，
+ * 异常被 catch 吞掉 → 表现成「密码永远不对」，极难查。正确做法是从 UserModel 拿一个
+ * **User 实例**（实例自带 `checkPassword`），这也是 Hydro 官方的用法。</para>
+ */
 async function checkPassword(udoc: any, password: string): Promise<boolean> {
-    try {
-        const u: any = new (User as any)(udoc);
-        if (typeof u.checkPassword === 'function') return !!(await u.checkPassword(password));
-    } catch { /* 试静态方法 */ }
     const M: any = UserModel;
+    const getters: Array<() => any> = [
+        () => M.getById?.('system', udoc._id),
+        () => M.getById?.(udoc._id),
+    ];
+    for (const get of getters) {
+        try {
+            const u: any = await get();
+            if (u && typeof u.checkPassword === 'function') return !!(await u.checkPassword(password));
+        } catch { /* 试下一个 */ }
+    }
     for (const m of ['checkPassword', 'verifyPassword', 'checkPass']) {
         try {
             if (typeof M[m] === 'function') {

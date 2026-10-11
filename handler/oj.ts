@@ -9,7 +9,9 @@
  *      `document` / `record` / `domain.user` 这几个集合里）。
  * 这样即便 Hydro 升级改了 API，接口也不会整个挂掉。
  */
-import { ProblemModel, RecordModel, ContestModel, DiscussionModel } from 'hydrooj';
+import {
+    ObjectId, ProblemModel, RecordModel, ContestModel, DiscussionModel,
+} from 'hydrooj';
 import { ClientApiHandler } from './base';
 
 /** 兼容：有的版本返回游标，有的返回数组。 */
@@ -179,7 +181,6 @@ export class RecordDetailHandler extends ClientApiHandler {
         } catch { /* 回退 */ }
         if (!rdoc) {
             try {
-                const { ObjectId } = await import('mongodb');
                 rdoc = await ctx.db.collection('record').findOne({ _id: new ObjectId(rid) });
             } catch { /* 真找不到 */ }
         }

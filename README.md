@@ -211,14 +211,18 @@ hydrooj-client-gateway/
 
 ## 八、测试（改完代码先跑这个）
 
-**不需要装 Hydro、不需要 MongoDB** —— 用 Node 自带的 TS 支持 + 一个内存假存储就能跑：
+**不需要装 Hydro、不需要 MongoDB**。两套测试，一条命令跑完：
 
 ```bash
-node test/prepare.mjs
-node --experimental-strip-types test/test.ts
+npm test
+# 等价于下面两条：
+#   node test/prepare.mjs && node --experimental-strip-types test/test.ts
+#   node --experimental-strip-types test/load-check.mjs
 ```
 
-覆盖 68 个断言：
+### ① `test.ts` —— 逻辑测试（68 个断言）
+
+用内存假存储跑真实的签到逻辑。覆盖：
 
 - 时间：时区边界（UTC 16:30 算作上海的次日）、跨月、跨闰年；
 - 签到：首次 / 幂等 / 连续累加 / 断签重置 / 连签 7 天；
@@ -233,7 +237,28 @@ node --experimental-strip-types test/test.ts
 > ⚠️ 这是**逻辑级**验证：唯一索引冲突是在假存储里模拟的，不是真的 MongoDB。
 > 它验的是「代码路径对不对」，MongoDB 本身的行为不用它来验。
 
-**已经靠它抓到并修掉的三个问题**（都在源码注释里标了）：
+### ② `load-check.mjs` —— 真加载 + 真注册
+
+`test.ts` 只跑 `model.ts` / `lib.ts`，**碰不到 `index.ts` 和各 handler** —— 而实际踩的坑恰恰在加载阶段。
+这个测试把整个插件在 Node 里**真 import 一遍、真调一次 `apply()`**，然后要求注册出 35 条路由。
+
+**为什么必须有它**：Hydro 的三个加载器（service / model / addon）**共用同一个 `fail` 列表**，
+任何一个文件加载失败，整个插件的 `index.ts`（35 条路由）都会被跳过 —— 线上表现是
+**所有 `/client-api/*` 全部 404**，而且看着完全不像「插件没装成功」。
+
+它已经抓到两个逻辑测试发现不了的问题（都已修）：
+
+1. **`import { ObjectId } from 'mongodb'`** —— 插件装在 `~/.hydro/addons/` 下时，Node 从那里
+   往上找不到 `mongodb` 的 `node_modules`，require 直接抛错 → 整个插件废掉。
+   现在改从 `hydrooj` 取（Hydro 把 `ObjectId` / `Schema` 都**再导出**了，
+   见 `packages/hydrooj/src/libs.ts`）—— **插件现在只依赖 `hydrooj` 这一个包**。
+2. **`import { TokenInfo } from '../model'`** —— `TokenInfo` 是 interface，当值导入在 ESM 下是
+   硬错误（`does not provide an export named 'TokenInfo'`）。改成 `import type`。
+
+> ⚠️ **写这个插件的铁律：除了 `hydrooj` 和 Node 内置模块，什么都别 import。**
+> 裸包名在插件目录下解析不到，而失败方式极隐蔽 —— 不是报错页，是**整片接口 404**。
+
+**逻辑测试这边抓到并修掉的三个问题**（都在源码注释里标了）：
 
 1. 奖励计算写成 `streak === day || streak % day === 0` —— 连续第 6 天会拿到「连续 3 天」的奖励，
    而且 `streak = 0` 时所有取模都命中，一次算出好几倍。现在拆成显式的「里程碑 / 周期」两种语义。

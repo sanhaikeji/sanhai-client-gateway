@@ -1,6 +1,6 @@
 {
   "name": "hydrooj-client-gateway",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "description": "SanhaiOJ 桌面客户端通道：给客户端提供一套带令牌认证的 JSON API（签到、硬币、题目、提交、排行……）",
   "main": "index.ts",
   "author": "sanhai",
@@ -20,7 +20,10 @@
     "api",
     "checkin"
   ],
+  "scripts": {
+    "test": "node test/prepare.mjs && node --experimental-strip-types test/test.ts && node --experimental-strip-types test/load-check.mjs"
+  },
   "peerDependencies": {
-    "hydrooj": "^4.9.0"
+    "hydrooj": ">=4.9.0"
   }
 }

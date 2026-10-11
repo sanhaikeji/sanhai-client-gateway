@@ -11,8 +11,12 @@
  *
  * 安装后到「控制面板 → 系统设置 → hydrooj → 客户端通道」里配置奖励规则。
  */
-import { Context, PRIV } from 'hydrooj';
-import Schema from 'schemastery';
+// ⚠️ 只从 'hydrooj' 取东西。别 import 'schemastery' / 'mongodb' 这类裸包名 ——
+//    插件被装到 ~/.hydro/addons/ 下时，Node 从那里往上找不到它们的 node_modules，
+//    require 直接抛错。而 hydrooj 把这两个都**再导出**了（packages/hydrooj/src/libs.ts：
+//    `export { _, ObjectID, Schema }` / `export { Filter, ObjectId } from 'mongodb'`），
+//    所以从 'hydrooj' 拿是同一个东西，且一定解析得到。
+import { Context, PRIV, Schema } from 'hydrooj';
 import * as H from './handler';
 import { init as initModel, diagnose } from './model';
 

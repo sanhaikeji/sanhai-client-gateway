@@ -2,8 +2,9 @@
  * 测试环境的准备脚本：把插件源码搬进 test/.build/，让 Node 能直接跑。
  *
  * 为什么要这一步：源码里的 import 写的是 `from './lib'`（不带扩展名，TS 的常规写法），
- * 而 Node 原生跑 TS 时要求写全 `./lib.ts`。所以这里复制一份、只改 import 路径，
- * **不动源码本身**（Hydro 的构建流程认的是不带扩展名的写法）。
+ * 而 Node 原生跑 TS 时要求写全 `./lib.ts`。另外 `hydrooj` 是服务器上才有的包，
+ * 本机没有 —— 所以要把它换成一个只提供 `ObjectId` 的小替身。
+ * **只改副本，不动源码本身**（Hydro 的构建流程认的是不带扩展名的写法）。
  *
  * 用法：
  *     node test/prepare.mjs && node --experimental-strip-types test/test.ts
@@ -22,18 +23,24 @@ mkdirSync(OUT, { recursive: true });
 // lib.ts 原样搬（只依赖 node 内置的 crypto）
 copyFileSync(join(SRC, 'lib.ts'), join(OUT, 'lib.ts'));
 
-// model.ts：只改 import 的解析路径 —— './lib' 补扩展名；mongodb 换成小替身
+// model.ts：把解析路径改成本机能跑的 —— './lib' 补扩展名，'hydrooj' 换成小替身
 let m = readFileSync(join(SRC, 'model.ts'), 'utf8');
 const before = m;
-m = m.replace("from './lib'", "from './lib.ts'").replace("from 'mongodb'", "from './_oid.ts'");
+m = m.replaceAll("from './lib'", "from './lib.ts'");
+m = m.replaceAll("from 'hydrooj'", "from './_hydro.ts'");
 if (m === before) {
     console.error('!! model.ts 的 import 没被替换 —— 检查源码里的写法是否变了');
     process.exit(1);
 }
+if (!m.includes("./_hydro.ts")) {
+    console.error('!! model.ts 没有从 hydrooj 导入任何东西 —— 检查是否漏了 ObjectId');
+    process.exit(1);
+}
 writeFileSync(join(OUT, 'model.ts'), m);
 
-// ObjectId 替身（签到流程用不到它，只是让 import 成立）
-writeFileSync(join(OUT, '_oid.ts'), [
+// hydrooj 替身：只提供源码真正用到的值（签到流程本身不依赖它）
+writeFileSync(join(OUT, '_hydro.ts'), [
+    '/** 服务器上是真 hydrooj；本机测试只要 import 成立即可。 */',
     'export class ObjectId {',
     '    hex: string;',
     "    constructor(v?: string) { this.hex = v || '000000000000000000000000'; }",

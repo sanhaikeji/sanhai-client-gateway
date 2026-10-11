@@ -5,6 +5,7 @@
  * 这台 OJ 上有哪些功能可用（比如硬币插件装了没、签到开了没、我是不是管理员）。
  * 这样客户端不用为新功能发版，也不会对着一个不存在的接口反复重试。
  */
+import { ObjectId } from 'hydrooj';   // 别直接 import 'mongodb'，见 index.ts 顶部注释
 import { ClientApiHandler } from './base';
 import { getConfig, getState, diagnose } from '../model';
 import { isAdmin } from './coin';
@@ -98,7 +99,6 @@ export class NotificationReadHandler extends ClientApiHandler {
         const id = String(this.param('id', '')).trim();
         const all = String(this.param('all', '')) === '1';
         try {
-            const { ObjectId } = await import('mongodb');
             if (all) {
                 const r = await ctx.db.collection('message')
                     .updateMany({ to: this.clientUid, read: { $ne: true } }, { $set: { read: true } });
