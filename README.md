@@ -205,7 +205,7 @@ hydrooj-client-gateway/
 └── README.md
 ```
 
-完整接口清单见项目根目录的 **`客户端API清单.md`**。
+完整接口清单见 **[`API.md`](./API.md)**（35 个接口 + 客户端典型调用流程）。
 
 ---
 
