@@ -21,12 +21,23 @@
 ## 二、安装
 
 ```bash
-# 1. 把整个文件夹放到服务器上任意位置，例如 /root/addon/
-# 2. 注册插件（绝对路径）
-hydrooj addon add /root/addon/hydrooj-client-gateway
+# 1. 拉到服务器（推荐：以后更新只要 git pull）
+cd /root/addon
+git clone https://github.com/sanhaikeji/sanhai-client-gateway.git
+
+#    （没有 git / 想手动传：把整个目录放到 /root/addon/ 下即可，目录名随意）
+
+# 2. 注册插件（用实际绝对路径）
+hydrooj addon add /root/addon/sanhai-client-gateway
 
 # 3. 重启（pm2 方式）
 pm2 restart hydrooj
+```
+
+以后更新：
+
+```bash
+cd /root/addon/sanhai-client-gateway && git pull && pm2 restart hydrooj
 ```
 
 装完访问 `https://你的域名/client-api/ping`，能看到一段 JSON 就说明通了：
