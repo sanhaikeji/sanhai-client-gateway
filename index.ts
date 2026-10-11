@@ -36,8 +36,9 @@ const DEFAULTS = {
     makeupReward: 0,
     coinEnabled: true,
     coinUserCollection: 'user',
-    coinUserField: 'coin',
+    coinUserField: 'coin_now',      // SanhaiOJ 上 coin-33oj 用的字段（自检实测）
     coinBillCollection: 'coin.bill',
+    coinWriteBill: true,            // 发币时是否同时写一张账单表
     adminUids: [5],
     checkinCollection: 'clientgw.checkin',
     checkinLogCollection: 'clientgw.checkin_log',
@@ -63,8 +64,11 @@ export const Config = Schema.object({
 
     coinEnabled: Schema.boolean().default(true).description('启用硬币发放与读取'),
     coinUserCollection: Schema.string().default('user').description('存硬币数量的集合'),
-    coinUserField: Schema.string().default('coin').description('用户文档上记硬币数量的字段名'),
+    coinUserField: Schema.string().default('coin_now')
+        .description('用户文档上记硬币数量的字段名（SanhaiOJ 是 coin_now）'),
     coinBillCollection: Schema.string().default('coin.bill').description('硬币账单集合'),
+    coinWriteBill: Schema.boolean().default(true)
+        .description('发币时是否同时往账单集合写一条流水（关掉 = 只加余额）'),
     adminUids: Schema.array(Schema.number()).default([5]).description('能发硬币 / 看全部账单的 uid'),
 
     checkinCollection: Schema.string().default('clientgw.checkin').description('签到状态集合'),
@@ -149,8 +153,14 @@ export async function apply(ctx: Context, config: any = {}) {
                 if (r.coin.suggestedField && r.coin.suggestedField !== r.coin.userField) {
                     ctx.logger?.warn?.(`[clientgw] 建议把 coinUserField 改成 \`${r.coin.suggestedField}\``);
                 }
-                if (r.coin.suggestedBillCollection && !r.coin.billCollectionExists) {
-                    ctx.logger?.warn?.(`[clientgw] 建议把 coinBillCollection 改成 \`${r.coin.suggestedBillCollection}\``);
+                if (!r.coin.billCollectionExists) {
+                    if (r.coin.suggestedBillCollection) {
+                        ctx.logger?.warn?.(`[clientgw] 建议把 coinBillCollection 改成 \`${r.coin.suggestedBillCollection}\``);
+                    } else {
+                        // 连「像账单的集合」都找不到时，把库里的集合名列出来 ——
+                        // 光说「不在库里」帮不上忙，得让人看见真实的名字才能配。
+                        ctx.logger?.warn?.(`[clientgw] 库里现有的集合（找一个像账单的填进 coinBillCollection）：${(r.collections || []).join('、')}`);
+                    }
                 }
             })
             .catch((e) => ctx.logger?.warn?.(`[clientgw] 自检没跑成：${(e as Error).message}`));

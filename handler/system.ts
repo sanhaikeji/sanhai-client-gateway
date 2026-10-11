@@ -36,8 +36,8 @@ export class CapabilitiesHandler extends ClientApiHandler {
         let hasCoin = false;
         try {
             const c = await ctx.db.collection(cfg.coinUserCollection || 'user')
-                .findOne({ _id: this.clientUid }, { projection: { [cfg.coinUserField || 'coin']: 1 } });
-            hasCoin = !!(c && c[cfg.coinUserField || 'coin'] !== undefined);
+                .findOne({ _id: this.clientUid }, { projection: { [cfg.coinUserField || 'coin_now']: 1 } });
+            hasCoin = !!(c && c[cfg.coinUserField || 'coin_now'] !== undefined);
         } catch { /* 没有就没有 */ }
 
         this.ok({

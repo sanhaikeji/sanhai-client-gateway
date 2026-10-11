@@ -144,24 +144,47 @@ Authorization: Bearer <token>
 
 发硬币这件事**必须按你服务器上装的那个硬币插件来调**。你这套装的是 **`coin-33oj`**（33OJ 那套），它的做法是：
 
-- **余额**：用户文档上一个数字字段（默认假设叫 `coin`）
-- **流水**：一张账单集合（默认假设叫 `coin.bill`）
+- **余额**：用户文档上一个数字字段 —— **SanhaiOJ 上是 `coin_now`**（已由自检实测确认，也是默认值）
+- **流水**：一张账单集合 —— 默认假设叫 `coin.bill`，**但这一点还没确认**（见下）
 
-**确认方法**（在服务器上跑，数据库名一般是 `hydro`）：
+### 怎么确认（别猜，猜错不会报错）
 
-```bash
-# 看看用户文档上到底有没有 coin 字段、叫什么名字
-mongosh hydro --eval 'printjson(db.user.findOne({_id: 5}))'
+**装完先看启动日志**，插件自己会查一遍：
 
-# 找和硬币有关的集合
-mongosh hydro --eval 'printjson(db.getCollectionNames().filter(n => /coin/i.test(n)))'
+```
+[clientgw] 自检：有 2 处配置要确认
+[clientgw] 待确认：硬币字段 user.coin_now 读不到 —— 发币会失败，检查 coinUserField
+[clientgw] 待确认：账单集合 coin.bill 不在库里 —— 检查 coinBillCollection
+[clientgw] 库里现有的集合（找一个像账单的填进 coinBillCollection）：user、record、oplog、...
 ```
 
-- 如果字段名不是 `coin` → 改配置 **`coinUserField`**；
-- 如果账单集合名不一样 → 改 **`coinBillCollection`**；
-- 如果余额不在 `user` 集合 → 改 **`coinUserCollection`**。
+最后那行会把**库里所有集合名列出来** —— 里面哪个像账单就填进 `coinBillCollection`。
+
+也可以自己查（数据库名一般是 `hydro`）：
+
+```bash
+# 1) 用户文档上到底有没有硬币字段、叫什么
+mongosh hydro --eval 'printjson(db.user.findOne({_id: 5}))'
+
+# 2) 列出所有集合（注意：**不要只筛 /coin/i** —— SanhaiOJ 上没有一个集合名含 coin，
+#    所以账单表要么叫别的名字，要么根本不存在，得看全量清单）
+mongosh hydro --eval 'printjson(db.getCollectionNames())'
+```
+
+### 对应的三个配置项
+
+| 配置 | 默认 | 说明 |
+|---|---|---|
+| `coinUserField` | `coin_now` | 用户文档上记余额的字段名 |
+| `coinUserCollection` | `user` | 余额存在哪个集合（一般不用改） |
+| `coinBillCollection` | `coin.bill` | 账单集合名；**写出错不会影响发币**（余额已经加上） |
+| `coinWriteBill` | `true` | 关掉 = 只加余额、不写账单表 |
 
 改完不用重启（Hydro 会热重载设置）。
+
+> ⚠️ 如果账单表名一直配不对，**不会丢币**：余额是直接 `$inc` 到用户文档上的，
+> 账单写入失败只会在日志里留一条 warn。真正会因为配错而**静默失败的是字段名**
+> —— 所以自检优先盯的是 `coinUserField`。
 
 > 也可以直接调用 coin-33oj 自己的入口对比一下：`/coin/inc`（管理员加币）、`/coin/bill`（账单）。
 

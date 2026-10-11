@@ -343,7 +343,7 @@ export async function recentLogs(uid: number, limit = 30) {
 export async function grantCoin(uid: number, amount: number, note: string) {
     const c = ctx();
     const userColl = c.db.collection(cfg.coinUserCollection || 'user');
-    const field = cfg.coinUserField || 'coin';
+    const field = cfg.coinUserField || 'coin_now';
     const r = await userColl.updateOne({ _id: uid }, { $inc: { [field]: amount } });
 
     // ⚠️ 匹配不到用户时 updateOne **不报错**，只是 matchedCount = 0 —— 硬币会**静默消失**。
@@ -356,15 +356,23 @@ export async function grantCoin(uid: number, amount: number, note: string) {
         );
     }
 
-    await c.db.collection(cfg.coinBillCollection || 'coin.bill').insertOne({
-        uid, amount, note, ts: new Date(),
-    });
+    // 账单（流水）—— **尽力而为**：余额上面已经加上了，这里失败不该让调用方以为「没发出去」。
+    // 名字配错最多多一个空集合，不会丢币；不想要这张表就把 coinWriteBill 关掉。
+    if (cfg.coinWriteBill !== false) {
+        try {
+            await c.db.collection(cfg.coinBillCollection || 'coin.bill').insertOne({
+                uid, amount, note, ts: new Date(),
+            });
+        } catch (e) {
+            ctx().logger?.warn?.(`[clientgw] 写硬币账单失败（余额已加，不影响发币）：${(e as Error).message}`);
+        }
+    }
 }
 
 /** 读余额（同样按上面的假设）。 */
 export async function coinBalance(uid: number): Promise<number> {
     const c = ctx();
-    const field = cfg.coinUserField || 'coin';
+    const field = cfg.coinUserField || 'coin_now';
     const d = await c.db.collection(cfg.coinUserCollection || 'user').findOne(
         { _id: uid }, { projection: { [field]: 1 } },
     );
@@ -406,7 +414,7 @@ export async function diagnose(uid?: number): Promise<DiagnoseResult> {
 
     // ---- 硬币 ----
     const uColl = cfg.coinUserCollection || 'user';
-    const field = cfg.coinUserField || 'coin';
+    const field = cfg.coinUserField || 'coin_now';
     let numericFields: string[] = [];
     let fieldExists = false;
     let sampleValue: number | null = null;

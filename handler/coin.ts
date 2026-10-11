@@ -53,7 +53,7 @@ export class CoinRankHandler extends ClientApiHandler {
         const ctx: any = (this as any).ctx;
         const cfg: any = getConfig();
         const limit = Math.min(200, Math.max(1, this.intParam('limit', 50)));
-        const field = cfg.coinUserField || 'coin';
+        const field = cfg.coinUserField || 'coin_now';
         let rows: any[] = [];
         try {
             rows = await ctx.db.collection(cfg.coinUserCollection || 'user')
