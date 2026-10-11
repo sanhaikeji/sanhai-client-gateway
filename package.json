@@ -1,0 +1,26 @@
+{
+  "name": "hydrooj-client-gateway",
+  "version": "1.0.0",
+  "description": "SanhaiOJ 桌面客户端通道：给客户端提供一套带令牌认证的 JSON API（签到、硬币、题目、提交、排行……）",
+  "main": "index.ts",
+  "author": "sanhai",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/sanhaikeji/sanhai-client-gateway.git"
+  },
+  "bugs": {
+    "url": "https://github.com/sanhaikeji/sanhai-client-gateway/issues"
+  },
+  "homepage": "https://github.com/sanhaikeji/sanhai-client-gateway#readme",
+  "keywords": [
+    "hydrooj",
+    "plugin",
+    "client",
+    "api",
+    "checkin"
+  ],
+  "peerDependencies": {
+    "hydrooj": "^4.9.0"
+  }
+}

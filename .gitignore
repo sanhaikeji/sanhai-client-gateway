@@ -1,0 +1,10 @@
+# 依赖（如果有人 npm install 跑测试）
+node_modules/
+
+# 测试的生成目录（prepare.mjs 每次重建）
+test/.build/
+
+# 杂项
+*.log
+.DS_Store
+Thumbs.db
