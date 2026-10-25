@@ -45,8 +45,8 @@ Authorization: Bearer <token>
 | GET | `/client-api/ping` | 不需要 | 连通性 + 服务端时间（客户端猜时钟差用） |
 | GET | `/client-api/capabilities` | 需要 | **能力清单**：这台 OJ 有哪些功能可用、我是不是管理员 |
 | GET | `/client-api/diagnose` | 需要（管理员） | **自检**：硬币字段 / 账单集合配得对不对（含建议值） |
-| GET | `/client-api/notifications` | 需要 | 私信/通知列表 |
-| POST | `/client-api/notifications/read` | 需要 | 标记已读（`id=xxx` 或 `all=1`） |
+| GET | `/client-api/notifications` | 需要 | 私信/通知列表（`unread` 为精确全量，`byConv` 为分会话未读） |
+| POST | `/client-api/notifications/read` | 需要 | 标记已读（`all=1` / `conv=` / `ids=` / `id=`，按账号记） |
 
 **`/client-api/capabilities` 建议客户端启动时第一个调** —— 它告诉客户端该显示什么：
 
@@ -58,7 +58,7 @@ Authorization: Bearer <token>
     "checkin": true, "checkinMakeup": true, "coin": true,
     "problems": true, "records": true, "submit": true,
     "contests": true, "discussions": true, "ranking": true,
-    "notifications": true, "pairLogin": true
+    "notifications": true, "notificationsReadBy": true, "pairLogin": true
   },
   "checkin": { "signedToday": false, "streak": 6, "makeupWindow": 3, "makeupCost": 5 },
   "isAdmin": true,
@@ -67,6 +67,74 @@ Authorization: Bearer <token>
 ```
 
 这样以后加功能不用发新版客户端：新功能开关由服务端告诉它。
+
+### 私信
+
+**`GET /client-api/notifications`** —— 私信列表（`limit` 默认 20，最大 100）
+
+```jsonc
+{
+  "ok": true,
+  "unread": 37,               // ★ 精确的全量未读数，与 limit / 分页无关
+  "byConv": {                 // ★ 分会话未读：key 是对方 uid（字符串），value 是未读条数
+    "5": 12,
+    "7": 3
+  },
+  "messages": [
+    {
+      "id": "670f1c...",
+      "from": 5,
+      "content": "……（最多 500 字）",
+      "read": false,          // ★ 当前用户视角：我读过没有
+      "readAt": null,         // 我读到的时间（ISO 字符串）；没读 / 老数据为 null
+      "at": 1697000000000
+    }
+  ]
+}
+```
+
+> **`read` 是「我」的视角，不是消息的全局状态。** 一条消息可以同时发给多个人（`to` 是数组），
+> A 读过之后 B 仍是未读 —— 已读按 **uid** 记在消息文档上，所以**跨设备一致**：
+> 换台电脑登录同一个账号，已读还是已读。
+> 升级前就标记过已读的老消息仍算已读，不会突然全变未读。
+> `unread` 用 `countDocuments` 全量数，**不受 `limit` 限制**（老版本只数当前页，未读超过 20 时角标会卡住）。
+>
+> **`byConv`** —— 按对方（`from`）分组的未读聚合，口径和 `unread` **完全一致**
+> （同一个查询条件 `$match`），所以 `sum(byConv) === unread`。
+> `from` 在库里可能存成数字或字符串，统一数字化后当 key（同一会话不会因为存储类型不同被算成两个）。
+> 一条发给多人的消息（`to` 是数组）对**每个**收件人各算 1。
+> 聚合失败（老库 / 账号没有聚合权限）时返回 `{}` —— `unread` / `messages` 照常给，**不会报错**。
+
+**`POST /client-api/notifications/read`** —— 标记已读
+
+| 参数 | 说明 |
+|---|---|
+| `all=1` | 把我收到的全部标记为已读（顺手清网页端 `unreadMsg` 角标） |
+| `conv=<uid>` | 只清**这个会话**：`from` 为该 uid、且我是收件人的未读全部已读 |
+| `ids=<id1,id2,...>` | 批量按消息 id 清，逗号分隔；**最多 200 个**（超出截断），非法 id 跳过不报错 |
+| `id=xxx` | 标记单条 |
+
+**优先级：`all=1` > `conv` > `ids` > `id`** —— 同时传多个时只按最左边那个走，**不叠加**。
+一个参数都不给会报错（`请给出消息 id，或传 all=1 全部已读`）。
+
+> ⚠️ 客户端 POST 的 body 恒为 `{}`，**参数请放在 query 上**（如
+> `POST /client-api/notifications/read?conv=5`）。
+
+```jsonc
+{
+  "ok": true,
+  "updated": 3,               // 实际改动的条数
+  "scope": "conv"             // "all" | "conv" | "ids" | "one"，告诉客户端这次按哪条规则走的
+}
+```
+
+> `scope` 用来让客户端确认服务端**真的**按新语义执行了（老版本服务端不会返回这个字段，
+> 也会忽略 `conv` / `ids`）—— 客户端可先看 `features.notificationsReadBy`。
+> `conv` 同时用 `from: { $in: [Number(conv), String(conv)] }` 匹配，**`from` 存成字符串也能清掉**。
+> 只会改动**「我」那一份**已读状态：同一份消息文档里其他收件人的状态原样不动。
+> 只能标记自己是收件人的消息 —— 拿别人的消息 id 来标记会得到 `updated: 0`，不会改动任何数据。
+> `all=1` 还会顺手把 Hydro 网页端的未读角标（用户文档上的 `unreadMsg`）清零，让网页端角标同步消失；
+> 这一步失败不影响已读本身。
 
 ---
 
@@ -174,6 +242,11 @@ Authorization: Bearer <token>
 |---|---|---|
 | GET | `/client-api/me` | 账号信息：uid / uname / role / 硬币 / rp / 名次 / 签到概况 |
 | GET | `/client-api/me/stats` | 统计：AC 数 / 提交数 / 通过率 / 最近 7 天提交趋势 |
+| GET | `/client-api/perms` | **当前域内权限**：建题 / 改题 / 看他人提交 / 看代码 / 发讨论… |
+
+> ⚠️ **权限是按域算的**，切换域之后要**重新拉一次** `/client-api/perms`。
+> 客户端原来判「能不能建题」是去抓 `/d/{domain}/problem/create` 的返回文本找关键字，
+> 那个做法不跟着域走 —— 这就是「有的域里建题功能没工作」的原因。
 
 ---
 
@@ -191,9 +264,22 @@ Authorization: Bearer <token>
 
 | 方法 | 路径 | 参数 | 说明 |
 |---|---|---|---|
-| GET | `/client-api/records` | `page, limit, mine=1, pid, uid` | 提交记录 |
-| GET | `/client-api/record` | `rid` | 评测详情（**自己的提交才返回代码**） |
+| GET | `/client-api/records` | `page, limit, mine=1, pid, uid, status` | 提交记录 |
+| GET | `/client-api/record` | `rid` | 评测详情（`canSeeCode` 告诉你代码给没给） |
 | POST | `/client-api/submit` | `pid, lang, code` | 提交代码 |
+
+**`/client-api/records` 的权限规则（和 Hydro 网页端完全一致）**：
+
+- 不带 `uid`（= 查全部）或 `uid` 是别人 → 需要 `PERM_VIEW_RECORD`；
+- 没权限时不带 `uid` → **自动收敛成只看自己**（返回 `uidScope` = 你自己）；
+- 没权限且**明确指名别人** → `403`，不做静默降级（否则调用方会以为拿到了别人的数据）；
+- 返回值带 `canViewAll`，客户端据此决定「本题全部提交 / 只看 AC」那些入口显不显示。
+
+`status=1` 即「只看 AC」。配合 `pid` 就能实现网页端的「按题目查看所有提交」。
+
+**`/client-api/record` 的代码可见性**：自己的记录永远给代码；
+看别人的需要 `PERM_READ_RECORD_CODE`，只看 AC 代码则 `PERM_READ_RECORD_CODE_ACCEPT`。
+返回里的 `isSelf` / `canSeeCode` 让客户端能区分「没代码」和「没权限看代码」。
 
 **提交**
 

@@ -19,6 +19,7 @@
 import { Context, PRIV, Schema } from 'hydrooj';
 import * as H from './handler';
 import { init as initModel, diagnose } from './model';
+import { initPoints } from './points';
 
 /** 配置默认值。与下面的 Schema 保持一致（Hydro 传进来的 config 可能缺字段，这里兜底）。 */
 const DEFAULTS = {
@@ -88,6 +89,7 @@ export const Config = Schema.object({
 export async function apply(ctx: Context, config: any = {}) {
     const cfg = { ...DEFAULTS, ...config };
     initModel(ctx, cfg);
+    initPoints(ctx, cfg);
 
     /** 注册一个路由。参数不传 = 不检查权限（认证在 ClientApiHandler 里自己做）。 */
     const R = (name: string, path: string, Handler: any, priv?: number) => {
@@ -116,6 +118,10 @@ export async function apply(ctx: Context, config: any = {}) {
     // ---------------- 我的
     R('client_api_me', '/client-api/me', H.MeHandler);
     R('client_api_me_stats', '/client-api/me/stats', H.MeStatsHandler);
+    // 当前域内的权限（建题 / 看他人提交 / 看代码 …）。
+    // ⚠️ 权限是**按域**算的，切域必须重新拉一次 —— 客户端原来只在登录时探一次，这是
+    //    「有的域里建题入口不见了」的根因。
+    R('client_api_perms', '/client-api/perms', H.PermsHandler);
 
     // ---------------- 签到
     R('client_api_checkin_status', '/client-api/checkin/status', H.CheckinStatusHandler);
@@ -146,6 +152,15 @@ export async function apply(ctx: Context, config: any = {}) {
     R('client_api_coin_bill', '/client-api/coin/bill', H.CoinBillHandler);
     R('client_api_coin_rank', '/client-api/coin/rank', H.CoinRankHandler);
     R('client_api_coin_inc', '/client-api/coin/inc', H.CoinIncHandler);
+
+    // 客户端积分（和站点硬币是两套货币，互不换算）
+    R('client_api_points', '/client-api/points', H.PointsMeHandler);
+    R('client_api_points_board', '/client-api/points/board', H.PointsBoardHandler);
+    R('client_api_points_gift', '/client-api/points/gift', H.PointsGiftHandler);
+    R('client_api_points_grant', '/client-api/points/grant', H.PointsGrantHandler);
+    // 任务中心
+    R('client_api_tasks', '/client-api/tasks', H.TaskListHandler);
+    R('client_api_tasks_claim', '/client-api/tasks/claim', H.TaskClaimHandler);
 
     ctx.logger?.info?.('[clientgw] 客户端通道已就绪：/client-api/*');
 

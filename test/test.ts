@@ -13,15 +13,49 @@ import {
     issueToken, verifyToken, revokeTokens, listTokens,
     issuePairCode, consumePairCode, coinBalance, grantCoin, diagnose,
 } from './.build/model.ts';
-import { dateKey, today, prevDay } from './.build/lib.ts';
+import { dateKey, today, prevDay, resolveRecordScope } from './.build/lib.ts';
+// 通知的两个 handler：这里跑的是**真实 handler 代码**（只把 import 路径改写成本机能跑的）
+import {
+    NotificationsHandler, NotificationReadHandler,
+} from './.build/handler/system.ts';
+import {
+    unreadFilter, readMark, isReadBy,
+} from './.build/notify.ts';
+// prepare.mjs 生成的 hydrooj 替身（只提供 ObjectId / Handler）—— 批量已读要用真 ObjectId
+import { ObjectId } from './.build/_hydro.ts';
 
 // ---------------------------------------------------------------- 假存储
 
+/** 点号路径取值：Mongo 的 `readBy.5` 指「readBy 字段下面的 5 字段」，不是字面字段名。 */
+function getPath(doc: any, path: string): any {
+    if (!path.includes('.')) return doc[path];
+    let cur = doc;
+    for (const k of path.split('.')) {
+        if (cur === null || cur === undefined) return undefined;
+        cur = cur[k];
+    }
+    return cur;
+}
+
+/** 点号路径写值：Mongo 的 `$set: { 'readBy.5': x }` 会把中间层自动建成对象。 */
+function setPath(doc: any, path: string, val: any) {
+    if (!path.includes('.')) { doc[path] = val; return; }
+    const ks = path.split('.');
+    let cur = doc;
+    for (const k of ks.slice(0, -1)) {
+        if (typeof cur[k] !== 'object' || cur[k] === null) cur[k] = {};
+        cur = cur[k];
+    }
+    cur[ks[ks.length - 1]] = val;
+}
+
 function match(doc: any, q: any): boolean {
     for (const [k, v] of Object.entries(q)) {
-        const dv = doc[k];
-        if (v && typeof v === 'object' && !Array.isArray(v)) {
+        const dv = getPath(doc, k);
+        if (v && typeof v === 'object' && !Array.isArray(v)
+            && Object.keys(v).some((x) => x.startsWith('$'))) {
             const o: any = v;
+            if ('$exists' in o) { if (!!o.$exists !== (dv !== undefined)) return false; continue; }
             if ('$in' in o) { if (!o.$in.map(String).includes(String(dv))) return false; continue; }
             if ('$ne' in o) { if (String(dv) === String(o.$ne)) return false; continue; }
             if ('$gte' in o) { if (!(dv >= o.$gte)) return false; continue; }
@@ -30,14 +64,21 @@ function match(doc: any, q: any): boolean {
             if ('$lt' in o) { if (!(dv < o.$lt)) return false; continue; }
             throw new Error('假存储不支持这个查询子句: ' + k + ' ' + JSON.stringify(o));
         }
+        // Mongo 的隐式数组匹配：`{to: 5}` 能匹配 `to: [5, 7]`（私信群发就是这种文档）
+        if (Array.isArray(dv)) {
+            if (!dv.some((x) => String(x) === String(v))) return false;
+            continue;
+        }
         if (String(dv) !== String(v)) return false;
     }
     return true;
 }
 
 function applyUpdate(doc: any, upd: any) {
-    if (upd.$set) for (const [k, v] of Object.entries(upd.$set)) doc[k] = v;
-    if (upd.$inc) for (const [k, v] of Object.entries(upd.$inc)) doc[k] = (Number(doc[k]) || 0) + Number(v);
+    if (upd.$set) for (const [k, v] of Object.entries(upd.$set)) setPath(doc, k, v);
+    if (upd.$inc) for (const [k, v] of Object.entries(upd.$inc)) {
+        setPath(doc, k, (Number(getPath(doc, k)) || 0) + Number(v));
+    }
 }
 
 function makeDB() {
@@ -102,6 +143,35 @@ function makeDB() {
                 },
                 async countDocuments(q: any) {
                     return c.docs.filter((d) => match(d, q || {})).length;
+                },
+                // byConv 用它做「按 from 分组计数」。只支持插件真正用到的那两个阶段，
+                // 遇到别的阶段直接抛 —— 别让假存储悄悄把错管道的测试变成「永远是 {}」。
+                aggregate(pipeline: any[]) {
+                    let arr = c.docs.slice();
+                    for (const stage of pipeline) {
+                        if (stage && stage.$match) {
+                            const q = stage.$match;
+                            arr = arr.filter((d) => match(d, q));
+                        } else if (stage && stage.$group) {
+                            const g = stage.$group;
+                            const key = String(g._id).replace(/^\$/, '');   // '$from' → 'from'
+                            const sumField = Object.keys(g).find((k) => k !== '_id');
+                            if (!sumField || g[sumField].$sum !== 1) {
+                                throw new Error('假存储只支持 { $sum: 1 }');
+                            }
+                            const acc = new Map<any, any>();
+                            for (const d of arr) {
+                                const k = getPath(d, key);
+                                const cur = acc.get(k) ?? { _id: k, [sumField]: 0 };
+                                cur[sumField] += 1;
+                                acc.set(k, cur);
+                            }
+                            arr = [...acc.values()];
+                        } else {
+                            throw new Error('假存储不支持这个聚合阶段: ' + JSON.stringify(stage));
+                        }
+                    }
+                    return { toArray: async () => arr.map((d) => ({ ...d })) };
                 },
                 // diagnose 用它试探「这个集合在不在、有多少条」
                 async estimatedDocumentCount() { return c.docs.length; },
@@ -356,6 +426,294 @@ async function main() {
         eq('参不上时退回自己写库', (await db.collection('user').findOne({ _id: U10 })).coin_now, 3);
         check('没有误调三参 inc', !calls.some((c) => c[0] === 'WRONG'), JSON.stringify(calls));
         (globalThis as any).Hydro = undefined;
+    }
+
+    section('17. 提交列表的权限门（与网页端同规则）★');
+    {
+        // 规则来源：Hydro handler/record.ts —— `if (q.uid !== this.user._id) checkPerm(PERM_VIEW_RECORD)`
+        // 也就是「不带 uid 查全部」和「查别人」都要权限。
+        const ME = 5;
+        const OTHER = 9;
+
+        // ---- 有权限的人 ----
+        let s = resolveRecordScope({ mine: false, uid: 0, clientUid: ME, canViewAll: true });
+        check('有权限·不带 uid → 不拒', !s.deny);
+        eq('有权限·不带 uid → 全部用户(0)', s.uid, 0);
+
+        s = resolveRecordScope({ mine: false, uid: OTHER, clientUid: ME, canViewAll: true });
+        check('有权限·查别人 → 不拒', !s.deny);
+        eq('有权限·查别人 → 保留该 uid', s.uid, OTHER);
+
+        // ---- 没权限的人 ----
+        s = resolveRecordScope({ mine: false, uid: 0, clientUid: ME, canViewAll: false });
+        check('无权限·不带 uid → 不拒（这是默认视图）', !s.deny);
+        eq('无权限·不带 uid → 收敛成自己', s.uid, ME);
+
+        s = resolveRecordScope({ mine: false, uid: OTHER, clientUid: ME, canViewAll: false });
+        check('无权限·指名别人 → 必须拒（越权）★', s.deny);
+
+        s = resolveRecordScope({ mine: false, uid: ME, clientUid: ME, canViewAll: false });
+        check('无权限·查自己 → 不拒', !s.deny);
+        eq('无权限·查自己 → uid 是自己', s.uid, ME);
+
+        // mine=1 是「我的提交」，任何权限下都只能是自己的 —— 防的是
+        // 「同时传 mine=1 和 uid=别人」这种绕过（mine 优先）。
+        s = resolveRecordScope({ mine: true, uid: OTHER, clientUid: ME, canViewAll: false });
+        eq('mine=1 时忽略 uid（无权限）', s.uid, ME);
+        s = resolveRecordScope({ mine: true, uid: OTHER, clientUid: ME, canViewAll: true });
+        eq('mine=1 时忽略 uid（有权限）', s.uid, ME);
+    }
+
+    section('18. 私信已读：跟着账号走 + 多收件人互不干扰 ★');
+    {
+        const A = 201; const B = 202;
+        await db.collection('user').insertOne({ _id: A, uname: 'ua', unreadMsg: 99 });
+        await db.collection('user').insertOne({ _id: B, uname: 'ub', unreadMsg: 99 });
+        const msg = db.collection('message');
+
+        // 一条消息发给两个人（to 是数组）—— 老写法「一人读 = 所有人已读」就炸在这种文档上
+        await msg.insertOne({ _id: 'm-shared', from: 1, to: [A, B], content: '群发' });
+        // 老数据：老插件只写了 read: true，没有 readBy
+        await msg.insertOne({
+            _id: 'm-legacy', from: 1, to: A, content: '老消息', read: true,
+        });
+        await msg.insertOne({ _id: 'm-a', from: 1, to: A, content: '只发给 A' });
+        // 25 条，用来把「未读被 limit 截断」暴露出来
+        for (let i = 0; i < 25; i += 1) {
+            await msg.insertOne({
+                _id: `m-bulk-${String(i).padStart(2, '0')}`, from: 1, to: A, content: `批量 ${i}`,
+            });
+        }
+
+        // 直接调 ran()：绕过认证（认证另有测试），跑真实的 handler 代码
+        const hctx = { db };
+        const callHandler = async (Ctor: any, uid: number, params: any = {}) => {
+            const h: any = Object.create(Ctor.prototype);
+            h.clientUid = uid;
+            h.args = {};
+            h.request = { body: { ...params }, query: {}, headers: {}, ip: '127.0.0.1' };
+            h.response = {};
+            (h as any).ctx = hctx;
+            await h.run();
+            return h.response.body;
+        };
+        const get = (uid: number, limit = 20) => callHandler(NotificationsHandler, uid, { limit });
+        const read = (uid: number, params: any) => callHandler(NotificationReadHandler, uid, params);
+
+        // ---- (a) 未读数不受 limit 限制 ----
+        let g = await get(A, 20);
+        eq('A 未读 = 25 批量 + 群发 + 单独 = 27（limit 只有 20）', g.unread, 27);
+        eq('A 只返回一页 20 条', g.messages.length, 20);
+        check('旧写法会数成 ≤20，这里必须 > limit', g.unread > g.messages.length, `unread=${g.unread}`);
+        eq('B 未读 = 1（只有群发那条）', (await get(B)).unread, 1);
+
+        // ---- (b) A 读了，B 仍未读 ----
+        const r1 = await read(A, { id: 'm-shared' });
+        eq('A 单条已读成功', r1.updated, 1);
+        const shared1 = await msg.findOne({ _id: 'm-shared' });
+        check('只写了 A 的 readBy 格子', !!shared1.readBy?.[String(A)], JSON.stringify(shared1.readBy));
+        check('没写 B 的 readBy 格子', shared1.readBy?.[String(B)] === undefined, JSON.stringify(shared1.readBy));
+        check('没再写全局 read:true（那是老写法的坑）', shared1.read === undefined, String(shared1.read));
+
+        g = await get(A);
+        eq('A 读后未读 26', g.unread, 26);
+        const mine = g.messages.find((m: any) => m.id === 'm-shared');
+        eq('A 视角 read=true', mine.read, true);
+        check('A 视角给了 readAt', typeof mine.readAt === 'string' && !Number.isNaN(Date.parse(mine.readAt)), String(mine.readAt));
+
+        g = await get(B);
+        eq('B 未读仍是 1（没被 A 带走）★', g.unread, 1);
+        eq('B 视角 read 仍是 false ★', g.messages.find((m: any) => m.id === 'm-shared').read, false);
+
+        // ---- 单条已读必须限定「我是收件人」----
+        const r2 = await read(B, { id: 'm-a' });
+        eq('B 读一条不属于自己的消息 → updated 0', r2.updated, 0);
+        const ma = await msg.findOne({ _id: 'm-a' });
+        check('B 的越权请求没写进 readBy', ma.readBy?.[String(B)] === undefined, JSON.stringify(ma.readBy));
+        eq('A 的 m-a 仍未读', (await get(A, 100)).messages.find((m: any) => m.id === 'm-a').read, false);
+
+        // ---- (c) 老数据 read:true 仍算已读 ----
+        g = await get(A, 100);
+        const legacy = g.messages.find((m: any) => m.id === 'm-legacy');
+        eq('老数据 A 视角 read=true', legacy.read, true);
+        eq('老数据没有 readAt', legacy.readAt, null);
+        eq('老数据不计入未读', g.unread, 26);
+
+        // ---- (d) all=1 只影响自己 ----
+        const r3 = await read(A, { all: '1' });
+        eq('A 全部已读 = 26 条（老数据那条不重复算）', r3.updated, 26);
+        g = await get(A);
+        eq('A 未读清零', g.unread, 0);
+        check('A 这一页全部 read=true', g.messages.every((m: any) => m.read === true));
+
+        g = await get(B);
+        eq('B 未读不受影响 ★', g.unread, 1);
+        eq('B 视角仍然未读 ★', g.messages.find((m: any) => m.id === 'm-shared').read, false);
+        const shared2 = await msg.findOne({ _id: 'm-shared' });
+        check('A 全读后仍没写全局 read', shared2.read === undefined, String(shared2.read));
+        check('B 的格子仍然不存在', shared2.readBy?.[String(B)] === undefined, JSON.stringify(shared2.readBy));
+
+        // ---- 顺手清 Hydro 网页端角标 ----
+        eq('A 的 unreadMsg 被清零', (await db.collection('user').findOne({ _id: A })).unreadMsg, 0);
+        eq('B 的 unreadMsg 没动', (await db.collection('user').findOne({ _id: B })).unreadMsg, 99);
+
+        // 清角标失败不能影响已读本身（这步只是附赠）
+        const realCollection = db.collection.bind(db);
+        db.collection = (name: string) => {
+            const c: any = realCollection(name);
+            if (name === 'user') return { ...c, updateOne: async () => { throw new Error('模拟清角标失败'); } };
+            return c;
+        };
+        const r4 = await read(A, { all: '1' });
+        db.collection = realCollection;
+        eq('清角标抛错时接口仍 ok', r4.ok, true);
+
+        section('19. 已读查询本身（防手拼路径）★');
+        eq('unreadFilter 用对象形式的点号路径', JSON.stringify(unreadFilter(A)),
+            JSON.stringify({ to: A, [`readBy.${A}`]: { $exists: false }, read: { $ne: true } }));
+        eq('readMark 只写自己那一格', Object.keys(readMark(A).$set), [`readBy.${A}`]);
+        eq('isReadBy 认老数据', isReadBy({ read: true }, A), true);
+        eq('isReadBy 不认别人的 readBy', isReadBy({ readBy: { [String(B)]: new Date() } }, A), false);
+        eq('isReadBy 认自己的 readBy', isReadBy({ readBy: { [String(A)]: new Date() } }, A), true);
+    }
+
+    // =============================================================================================
+    section('20. byConv 聚合 / conv= / ids= / 优先级 ★');
+    {
+        const hctx = { db };
+        const callHandler = async (Ctor: any, uid: number, params: any = {}) => {
+            const h: any = Object.create(Ctor.prototype);
+            h.clientUid = uid;
+            h.args = {};
+            h.request = { body: { ...params }, query: {}, headers: {}, ip: '127.0.0.1' };
+            h.response = {};
+            (h as any).ctx = hctx;
+            await h.run();
+            return h.response.body;
+        };
+        const get = (uid: number, limit = 20) => callHandler(NotificationsHandler, uid, { limit });
+        const read = (uid: number, params: any) => callHandler(NotificationReadHandler, uid, params);
+        const msg = db.collection('message');
+        const sum = (o: any) => Object.values(o || {}).reduce((s: any, x: any) => s + Number(x), 0);
+
+        // ---------------------------------------------------------------- (a) byConv
+        const A = 301; const B = 302;
+        await db.collection('user').insertOne({ _id: A, uname: 'u301', unreadMsg: 0 });
+        await db.collection('user').insertOne({ _id: B, uname: 'u302', unreadMsg: 0 });
+
+        // 一条消息发给两个人：对 A、对 B **各算 1**（不是各算 0.5、也不是只算一个人）
+        await msg.insertOne({ _id: 'c-shared', from: 11, to: [A, B], content: '群发' });
+        await msg.insertOne({ _id: 'c-a1', from: 11, to: A, content: '11 的第二条' });
+        await msg.insertOne({ _id: 'c-str', from: '12', to: A, content: 'from 存成字符串' });
+        await msg.insertOne({ _id: 'c-num', from: 12, to: A, content: 'from 存成数字' });
+        await msg.insertOne({ _id: 'c-legacy', from: 13, to: A, content: '老数据已读', read: true });
+        await msg.insertOne({ _id: 'c-only-str', from: '14', to: A, content: '只有字符串 from' });
+
+        let g = await get(A, 100);
+        eq('byConv 按 from 分组计数', g.byConv, { 11: 2, 12: 2, 14: 1 });
+        check('byConv 的 key 一律是字符串', Object.keys(g.byConv).every((k) => typeof k === 'string'),
+            JSON.stringify(Object.keys(g.byConv)));
+        eq('byConv 的数字/字符串 from 归到同一个会话', g.byConv['12'], 2);
+        eq('byConv 老数据 read:true 不算未读', g.byConv['13'], undefined);
+        eq('byConv 合计 == unread（同口径）', sum(g.byConv), g.unread);
+        eq('A 未读 5', g.unread, 5);
+
+        const gb = await get(B);
+        eq('群发那条对 B 也算 1 ★', gb.byConv, { 11: 1 });
+        eq('B 未读 1', gb.unread, 1);
+
+        // 聚合失败（老库 / 缺权限）→ byConv 只能是 {}，unread / messages 照常，绝不能 500
+        const realCollection = db.collection.bind(db);
+        db.collection = (name: string) => {
+            const c: any = realCollection(name);
+            if (name === 'message') {
+                return { ...c, aggregate: () => { throw new Error('模拟聚合失败（老库 / 缺权限）'); } };
+            }
+            return c;
+        };
+        const gFail = await get(A, 100);
+        db.collection = realCollection;
+        eq('聚合失败 → 不 500（ok 仍为 true）', gFail.ok, true);
+        eq('聚合失败 → byConv = {}', gFail.byConv, {});
+        eq('聚合失败 → unread 照常', gFail.unread, 5);
+        eq('聚合失败 → messages 照常', gFail.messages.length, 6);
+
+        // ---------------------------------------------------------------- (b) conv=
+        const rb = await read(A, { conv: '12' });
+        eq('conv=12 清掉 2 条', rb.updated, 2);
+        eq('conv= 返回 scope="conv"', rb.scope, 'conv');
+        g = await get(A, 100);
+        eq('conv= 清完只剩 11 / 14', g.byConv, { 11: 2, 14: 1 });
+        eq('A 未读 3（其他会话没被动）', g.unread, 3);
+        eq('B 完全不受 A 的 conv= 影响 ★', (await get(B)).unread, 1);
+
+        // from 存成字符串时也必须清得掉（只按 `$in: [Number, String]` 兜才走得通）
+        const rb2 = await read(A, { conv: '14' });
+        eq('conv=14 清掉 from 存成字符串的那条 ★', rb2.updated, 1);
+        eq('清完只剩会话 11', (await get(A, 100)).byConv, { 11: 2 });
+
+        // ---------------------------------------------------------------- (c) ids=
+        const C = 303;
+        await db.collection('user').insertOne({ _id: C, uname: 'u303', unreadMsg: 0 });
+        const hexes = ['a'.repeat(24), 'b'.repeat(24), 'c'.repeat(24)];
+        for (let i = 0; i < hexes.length; i += 1) {
+            await msg.insertOne({ _id: new ObjectId(hexes[i]), from: 21, to: C, content: `批量 ${i}` });
+        }
+        // 中间夹一个非法 id：跳过它，另外三个照常生效
+        const rc = await read(C, { ids: `${hexes[0]}, ${hexes[1]} ,not-an-id, ${hexes[2]}` });
+        eq('ids= 批量清 3 条（非法 id 跳过不报错）', rc.updated, 3);
+        eq('ids= 返回 scope="ids"', rc.scope, 'ids');
+        eq('C 未读清零', (await get(C)).unread, 0);
+
+        // 截断：一次给 205 个，只认前 200 个
+        const D = 304;
+        await db.collection('user').insertOne({ _id: D, uname: 'u304', unreadMsg: 0 });
+        const many: string[] = [];
+        for (let i = 0; i < 205; i += 1) {
+            const h = i.toString(16).padStart(24, '0');
+            many.push(h);
+            await msg.insertOne({ _id: new ObjectId(h), from: 22, to: D, content: `海量 ${i}` });
+        }
+        const rd = await read(D, { ids: many.join(',') });
+        eq('ids= 超过 200 个时截断成 200', rd.updated, 200);
+        eq('剩下 5 条仍未读 ★', (await get(D)).unread, 5);
+
+        // ---------------------------------------------------------------- (d) 优先级
+        const E = 305;
+        await db.collection('user').insertOne({ _id: E, uname: 'u305', unreadMsg: 0 });
+        for (let i = 0; i < 3; i += 1) {
+            await msg.insertOne({ _id: `e-21-${i}`, from: 21, to: E, content: '会话 21' });
+        }
+        for (let i = 0; i < 2; i += 1) {
+            await msg.insertOne({ _id: `e-22-${i}`, from: 22, to: E, content: '会话 22' });
+        }
+        const re = await read(E, { all: '1', conv: '21', ids: hexes[0] });
+        eq('all + conv + ids 同时传 → 只按 all 走', re.scope, 'all');
+        eq('按 all 清了全部 5 条', re.updated, 5);
+        eq('all 之后未读清零', (await get(E)).unread, 0);
+
+        const F = 306;
+        await db.collection('user').insertOne({ _id: F, uname: 'u306', unreadMsg: 0 });
+        const hex22 = 'd'.repeat(24);
+        for (let i = 0; i < 3; i += 1) {
+            await msg.insertOne({ _id: `f-21-${i}`, from: 21, to: F, content: '会话 21' });
+        }
+        await msg.insertOne({ _id: new ObjectId(hex22), from: 22, to: F, content: '会话 22 的可批量 id' });
+        await msg.insertOne({ _id: 'f-22-1', from: 22, to: F, content: '会话 22' });
+
+        const rf = await read(F, { conv: '21', ids: hex22 });
+        eq('conv + ids 同时传 → 只按 conv 走', rf.scope, 'conv');
+        eq('conv 只清 21 那 3 条（ids 被忽略）★', rf.updated, 3);
+        eq('会话 22 那 2 条原封不动 ★', (await get(F)).unread, 2);
+
+        // 都不给 → 保留原来的报错；单个 id → scope="one"
+        const rEmpty = await read(F, {});
+        eq('都不给参数 → ok=false（保留原提示）', rEmpty.ok, false);
+        check('报错提示没变', /请给出消息 id，或传 all=1 全部已读/.test(String(rEmpty.error)), String(rEmpty.error));
+        const rOne = await read(F, { id: hex22 });
+        eq('单个 id → scope="one"', rOne.scope, 'one');
+        eq('单个 id 只清 1 条', rOne.updated, 1);
+        eq('清完剩 1 条未读', (await get(F)).unread, 1);
     }
 
     console.log(`\n${'='.repeat(46)}`);

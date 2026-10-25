@@ -5,4 +5,5 @@ export * from './checkin';
 export * from './user';
 export * from './oj';
 export * from './coin';
+export * from './points';
 export * from './system';

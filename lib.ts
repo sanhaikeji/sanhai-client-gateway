@@ -84,3 +84,29 @@ export function clip(s: string | undefined, n: number): string {
     if (!s) return '';
     return s.length > n ? `${s.slice(0, n)}…` : s;
 }
+
+/**
+ * 提交列表的「查谁」决策 —— 抽成纯函数，方便测试。
+ *
+ * <para>规则和 Hydro 网页端完全一致（<c>handler/record.ts</c>）：
+ * 「不带 uid 查全部」或「查别人」都要 <c>PERM_VIEW_RECORD</c>。
+ * 网页端由 Hydro 自己拦，这里是令牌接口，**必须自己拦** ——
+ * 不拦就是任何人改一下 uid 参数就能看全站提交。</para>
+ *
+ * <para>⚠️ 注意「没权限时收敛成自己」和「明确指名别人时拒绝」是两种不同处理：
+ * 前者是没给筛选条件（默认视图），收敛是对的；后者是**明确越权请求**，
+ * 必须拒绝而不是悄悄换成自己的数据（那会让调用方以为拿到了别人的记录）。</para>
+ */
+export function resolveRecordScope(opts: {
+    mine: boolean;
+    uid: number;
+    clientUid: number;
+    canViewAll: boolean;
+}): { deny: boolean; uid: number } {
+    const uid = opts.mine ? opts.clientUid : opts.uid;
+    if (!opts.canViewAll) {
+        if (uid && uid !== opts.clientUid) return { deny: true, uid };
+        return { deny: false, uid: opts.clientUid };
+    }
+    return { deny: false, uid };
+}

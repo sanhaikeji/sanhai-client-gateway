@@ -76,14 +76,28 @@ export abstract class ClientApiHandler extends Handler {
         this.tokenInfo = info;
     }
 
-    /** 令牌从哪来：优先 Authorization 头，其次自定义头 / 查询串 / 表单。 */
+    /**
+     * 令牌从哪来：自定义头 → 查询串 → Authorization 头。
+     *
+     * <para>⚠️⚠️ <b>自定义头必须排在 Authorization 前面</b>（2026-10-13 实测踩到）。
+     * 桌面客户端直连时两种都行，但**服务端之间**调用会经过一层前置代理，
+     * 而那层代理会往请求上**强行塞一个自己的 <c>Authorization</c>**（实测收到的是
+     * 386 字符的代理令牌，不是客户端那 43 字符的）。</para>
+     *
+     * <para>原来「Authorization 优先」的写法在这种情况下会把代理的令牌当成用户的令牌送去校验，
+     * 结果永远是「令牌无效」—— 而同一个令牌从客户端直连明明是好的，极难排查。
+     * 把自定义头放前面，代发方（中转站等）用 <c>X-Client-Token</c> 就能稳定送达。</para>
+     *
+     * <para>这**不是**放宽安全：无论从哪个头取，都要过同一套 <c>verifyToken</c>，
+     * 拿不到有效令牌一样进不来。</para>
+     */
     protected readToken(): string {
         const h = ((this.request as any).headers || {}) as Record<string, any>;
-        const m = /^Bearer\s+(.+)$/i.exec(String(h.authorization || h.Authorization || ''));
-        if (m) return m[1].trim();
         if (h['x-client-token']) return String(h['x-client-token']).trim();
         const a = this.param('token', '');
-        return a ? String(a) : '';
+        if (a) return String(a);
+        const m = /^Bearer\s+(.+)$/i.exec(String(h.authorization || h.Authorization || ''));
+        return m ? m[1].trim() : '';
     }
 
     private authFail(message: string) {

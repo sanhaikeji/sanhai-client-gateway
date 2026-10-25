@@ -15,6 +15,7 @@ import {
     coinBalance, grantCoin, getConfig,
 } from '../model';
 import { today, yesterday } from '../lib';
+import { grantCheckinPoints } from '../points';
 
 /** 批量取用户名（排行榜要显示名字，光有 uid 没法看）。 */
 async function names(ctx: any, uids: number[]): Promise<Record<number, string>> {
@@ -68,12 +69,29 @@ export class CheckinDoHandler extends ClientApiHandler {
     protected async run() {
         const r = await doCheckin(this.clientUid);
         const st = await buildStatus((this as any).ctx, this.clientUid);
+
+        // ⭐ 打卡时**同时发客户端积分**（站点硬币之外的那一套）。
+        // 幂等键是 checkin:<uid>:<日期>，所以一天只发一次；重复签到拿不到第二份。
+        // 积分发放失败**不能影响打卡** —— 打卡是主功能，积分是附加的。
+        let points = 0;
+        let pointsBalanceAfter = 0;
+        try {
+            const p = await grantCheckinPoints(this.clientUid, r.already ? 0 : r.streak);
+            points = p.points;
+            pointsBalanceAfter = p.balance;
+        } catch (e: any) {
+            (this as any).ctx?.logger?.warn?.(`[clientgw] 打卡发积分失败（不影响打卡）：${e?.message || e}`);
+        }
+
         this.ok({
             ...r,
             already: !!r.already,
+            points,
+            pointsBalance: pointsBalanceAfter,
             message: r.already
                 ? '今天已经签过啦，明天再来～'
-                : `签到成功！连续 ${r.streak} 天，获得 ${r.reward} 硬币${r.bonusLabel ? `（${r.bonusLabel}）` : ''}`,
+                : `签到成功！连续 ${r.streak} 天，获得 ${r.reward} 硬币${r.bonusLabel ? `（${r.bonusLabel}）` : ''}`
+                  + (points ? `，另有 ${points} 客户端积分` : ''),
             status: st,
         });
     }

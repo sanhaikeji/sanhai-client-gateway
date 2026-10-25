@@ -6,7 +6,7 @@
  *   1) `import { ObjectId } from 'mongodb'` —— 插件装在 ~/.hydro/addons/ 下时，
  *      从那里往上找不到 mongodb 的 node_modules，require 直接抛错；
  *      而 Hydro 的三个加载器**共用同一个 fail 列表**，一个文件炸了，
- *      整个插件的 index.ts（35 条路由）都会被跳过 → 表现成**全部 404**。
+ *      整个插件的 index.ts（42 条路由）都会被跳过 → 表现成**全部 404**。
  *   2) `import { TokenInfo } from '../model'` —— TokenInfo 是 interface，
  *      当值导入在 ESM 下是硬错误（does not provide an export named）。
  * 这两类只有**真 import 一遍**才能发现，所以有了这个测试。
@@ -49,6 +49,26 @@ SchemaStub = new Proxy(function () {}, {
 });
 export const Schema = SchemaStub;
 export const PRIV = { PRIV_USER_PROFILE: 1, PRIV_EDIT_SYSTEM: 2, PRIV_CREATE_DOMAIN: 4, PRIV_ALL: 8 };
+// ⚠️ 权限常量在真 hydrooj 里是 **BigInt**（形如 1n 左移 n 位）。替身也必须给 BigInt ——
+//    给成 number 的话按位与在真环境里会抛
+//    "Cannot mix BigInt and other types"，而替身下却能跑过，等于白测。
+export const PERM = {
+    PERM_VIEW: 1n << 0n,
+    PERM_CREATE_PROBLEM: 1n << 4n,
+    PERM_EDIT_PROBLEM: 1n << 5n,
+    PERM_EDIT_PROBLEM_SELF: 1n << 6n,
+    PERM_VIEW_PROBLEM: 1n << 7n,
+    PERM_VIEW_PROBLEM_HIDDEN: 1n << 8n,
+    PERM_SUBMIT_PROBLEM: 1n << 9n,
+    PERM_READ_PROBLEM_DATA: 1n << 10n,
+    PERM_VIEW_RECORD: 1n << 70n,
+    PERM_READ_RECORD_CODE: 1n << 12n,
+    PERM_READ_RECORD_CODE_ACCEPT: 1n << 66n,
+    PERM_REJUDGE_PROBLEM: 1n << 13n,
+    PERM_REJUDGE: 1n << 14n,
+    PERM_CREATE_DISCUSSION: 1n << 28n,
+    PERM_VIEW_DISCUSSION: 1n << 27n,
+};
 export const UserModel = { getById: async () => null, getByUname: async () => null, getByEmail: async () => null };
 export const ProblemModel = { getMulti: async () => [] };
 export const RecordModel = { get: async () => null };
@@ -57,7 +77,7 @@ export const DiscussionModel = { getMulti: async () => [] };
 `);
 
 // ---------- 2) 拷源码，只把相对 import 补成带 .ts（目录要补 index.ts） ----------
-const files = ['index.ts', 'lib.ts', 'model.ts',
+const files = ['index.ts', 'lib.ts', 'notify.ts', 'model.ts', 'points.ts',
     ...readdirSync(join(SRC, 'handler')).filter((f) => f.endsWith('.ts')).map((f) => `handler/${f}`)];
 
 function fixImports(code, fileDir) {
@@ -121,8 +141,8 @@ try {
 
 console.log('注册到的路由：');
 for (const r of routes) console.log('  ' + r.path);
-if (routes.length !== 35) {
-    console.error(`\n✗ 期望 35 条路由，实际 ${routes.length} 条`);
+if (routes.length !== 42) {
+    console.error(`\n✗ 期望 42 条路由，实际 ${routes.length} 条`);
     process.exit(1);
 }
 console.log(`\n✓ 插件加载成功，注册了 ${routes.length} 条路由`);

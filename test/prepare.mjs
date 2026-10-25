@@ -23,6 +23,9 @@ mkdirSync(OUT, { recursive: true });
 // lib.ts 原样搬（只依赖 node 内置的 crypto）
 copyFileSync(join(SRC, 'lib.ts'), join(OUT, 'lib.ts'));
 
+// notify.ts 原样搬（纯函数，不 import 任何东西）
+copyFileSync(join(SRC, 'notify.ts'), join(OUT, 'notify.ts'));
+
 // model.ts：把解析路径改成本机能跑的 —— './lib' 补扩展名，'hydrooj' 换成小替身
 let m = readFileSync(join(SRC, 'model.ts'), 'utf8');
 const before = m;
@@ -47,7 +50,21 @@ writeFileSync(join(OUT, '_hydro.ts'), [
     '    toString() { return this.hex; }',
     '}',
     '',
+    '/** base.ts 里 `extends Handler` 用；测试直接调 run()，不走框架生命周期。 */',
+    'export class Handler { async prepare() {} }',
+    '',
 ].join('\n'));
+
+// handler 层：只搬通知相关的三个文件（base / coin / system），供 test.ts 直接跑
+// **真实的 handler 代码路径** —— 查询条件对不对、返回体对不对，都在这里验。
+mkdirSync(join(OUT, 'handler'), { recursive: true });
+for (const f of ['base.ts', 'coin.ts', 'system.ts']) {
+    let code = readFileSync(join(SRC, 'handler', f), 'utf8');
+    code = code.replaceAll("from 'hydrooj'", "from '../_hydro.ts'");
+    for (const dep of ['base', 'coin']) code = code.replaceAll(`from './${dep}'`, `from './${dep}.ts'`);
+    for (const dep of ['model', 'lib', 'notify']) code = code.replaceAll(`from '../${dep}'`, `from '../${dep}.ts'`);
+    writeFileSync(join(OUT, 'handler', f), code);
+}
 
 // 让 .build 下的 .ts 按 ESM 解析（否则 Node 当 CommonJS，import 直接语法错误）
 writeFileSync(join(OUT, 'package.json'), '{ "type": "module" }\n');
