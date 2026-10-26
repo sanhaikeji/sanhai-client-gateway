@@ -22,6 +22,8 @@ Authorization: Bearer <token>
 { "ok": true, ... }
 // 失败（HTTP 状态码同时会给出 400/401/403/404）
 { "ok": false, "error": "人类可读的说明" }
+// 需要客户端「按原因决定怎么办」的接口会**额外带 code**（目前是题面直传）
+{ "ok": false, "error": "…", "code": "no_statement" }
 ```
 
 | 状态码 | 含义 |
@@ -58,7 +60,8 @@ Authorization: Bearer <token>
     "checkin": true, "checkinMakeup": true, "coin": true,
     "problems": true, "records": true, "submit": true,
     "contests": true, "discussions": true, "ranking": true,
-    "notifications": true, "notificationsReadBy": true, "pairLogin": true
+    "notifications": true, "notificationsReadBy": true, "pairLogin": true,
+    "statementProxy": true
   },
   "checkin": { "signedToday": false, "streak": 6, "makeupWindow": 3, "makeupCost": 5 },
   "isAdmin": true,
@@ -321,8 +324,76 @@ Authorization: Bearer <token>
 | 方法 | 路径 | 参数 | 说明 |
 |---|---|---|---|
 | GET | `/client-api/problems` | `page, limit, q` | 题目列表（`q` 支持标题模糊 / 题号） |
-| GET | `/client-api/problem` | `pid` | 题目详情 |
+| GET | `/client-api/problem` | `pid` | 题目详情（`hasStatement` 告诉你有没有题面） |
 | GET | `/client-api/problem/random` | — | 随机一题 |
+| GET | `/client-api/statement` | `pid, tid?` | **题面直传**：服务端代取题面，客户端不用碰站点那个受防盗刷保护的页面 |
+
+### 题面直传 `/client-api/statement`
+
+**为什么需要它**：本站（SanhaiOJ）的题面**不在** `pdoc.content` 里 —— 题目详情会返回
+`hasStatement:false`，正文在站点自建的 `/sanhai-ui/statement/<token>` 上，而那条路由**有防盗刷**
+（UA 不含 `OjClient` 就 403 + 一句「禁止直接访问题面内容」）。客户端自己去爬必然踩坑，
+所以服务端代取一层。
+
+**请求**
+
+```
+GET /client-api/statement?pid=2605
+GET /client-api/statement?pid=2605&tid=37      // tid 可选，当前不影响取哪一页（预留）
+```
+
+**成功**（两种来源，看 `format` / `source`）
+
+```jsonc
+// A. 原版 Hydro / 代码源题目：题面就在 pdoc.content 里
+{ "ok": true, "pid": 2605, "title": "均分纸牌",
+  "format": "markdown", "content": "# 均分纸牌\n\n…",
+  "source": "pdoc", "chars": 412, "cached": false }
+
+// B. 本站：服务端去站点页拿 token 再取题面
+{ "ok": true, "pid": 2605, "title": "均分纸牌",
+  "format": "html", "html": "<!doctype html>…整页题面 HTML…",
+  "source": "site", "chars": 12345, "cached": false }
+```
+
+| 字段 | 说明 |
+|---|---|
+| `format` | `"markdown"` → 用 `content`；`"html"` → 用 `html`（**整页 HTML**，直接丢进 WebView） |
+| `source` | `"pdoc"` = 来自数据库；`"site"` = 服务端从站点代取 |
+| `chars` | 正文长度（`content.length` / `html.length`），客户端可拿它判空 |
+| `cached` | 是否命中服务端缓存 |
+
+**失败**：`ok:false`，并且**一定带 `code`** —— 客户端靠 `code` 决定回退方式，
+**不要按 HTTP 状态码分支**（下面几种都可能是 502）：
+
+| `code` | 含义 | 客户端建议动作 |
+|---|---|---|
+| `no_statement` | 这题没有题面（`pdoc.content` 为空，且站点页里也没有 token）。题目不存在也归这里 | 显示「本题暂无题面」，别重试 |
+| `site_unreachable` | 服务端自取题目页失败（非 2xx / 超时） | 可重试；连续失败则回退到网页版 |
+| `statement_blocked` | 拿到 token，但 `/sanhai-ui/statement/<token>` 非 2xx（权限 / 防盗刷 / 超时 / 拒绝页） | 回退到网页版 |
+| `login_required` | 站点页被踢去登录（302 → `/login`，或正文就是登录页） | 提示「需要登录站点」，走网页登录态 |
+
+> 关掉直传（`statementProxy=false`）时接口返回 **404**、`error: "题面直传已关闭"`，
+> 此时 `capabilities.features.statementProxy` 也是 `false` —— 客户端看到它就别调了。
+
+**缓存语义**
+
+- 服务端内存缓存，key = `域名:题目号`，TTL = `statementCacheSeconds`（默认 **60 秒**），最多 **200** 条（超了淘汰最旧的）。
+- **只缓存成功结果**：失败不缓存，所以站点抽风一下不会把这道题锁死一分钟。
+- 同一题**并发去重**：同时来的多个请求只会真正打一趟站点，其余等同一个结果。
+- 命中时 `cached:true`（正文与首次完全一致）。
+- `pdoc.content` 那条路径不经过缓存（本来就是一次数据库读），`cached` 恒为 `false`。
+
+**配置项**（控制面板 → 系统设置 → hydrooj → 客户端通道）
+
+| 配置 | 默认 | 说明 |
+|---|---|---|
+| `statementProxy` | `true` | 是否启用本接口（关掉 → 404） |
+| `statementSelfBase` | 空 | 服务端自取时用的站点地址。**留空 = 按当前请求的 Host 反推**（`X-Forwarded-Proto` 优先），通常不用填 |
+| `statementCacheSeconds` | `60` | 缓存秒数，`0` = 不缓存 |
+| `statementTimeoutMs` | `8000` | 单次自取超时，超时按 `site_unreachable` 计 |
+
+> 安全：服务端只把**正文**交出来，站点返回的 cookie / 响应头一律不透传给客户端。
 
 ---
 
@@ -426,7 +497,7 @@ POST /client-api/submit
 
 ---
 
-## 10. 全部接口速查（43 个）
+## 10. 全部接口速查（44 个）
 
 ```
 系统     GET  /client-api/ping
@@ -460,6 +531,7 @@ POST /client-api/submit
 题目    GET  /client-api/problems
         GET  /client-api/problem
         GET  /client-api/problem/random
+        GET  /client-api/statement                (题面直传)
 
 提交    GET  /client-api/records
         GET  /client-api/record

@@ -246,7 +246,7 @@ hydrooj-client-gateway/
 └── README.md
 ```
 
-完整接口清单见 **[`API.md`](./API.md)**（43 个接口 + 客户端典型调用流程）。
+完整接口清单见 **[`API.md`](./API.md)**（44 个接口 + 客户端典型调用流程）。
 
 ---
 

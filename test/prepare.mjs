@@ -48,7 +48,7 @@ p = p.replaceAll("from './model'", "from './model.ts'");
 p = p.replaceAll("from './lib'", "from './lib.ts'");
 writeFileSync(join(OUT, 'points.ts'), p);
 
-// hydrooj 替身：只提供源码真正用到的值（签到流程本身不依赖它）
+// hydrooj 替身：只提供源码真正用到的值
 writeFileSync(join(OUT, '_hydro.ts'), [
     '/** 服务器上是真 hydrooj；本机测试只要 import 成立即可。 */',
     'export class ObjectId {',
@@ -60,12 +60,24 @@ writeFileSync(join(OUT, '_hydro.ts'), [
     '/** base.ts 里 `extends Handler` 用；测试直接调 run()，不走框架生命周期。 */',
     'export class Handler { async prepare() {} }',
     '',
+    '/** 权限常量在真 hydrooj 里是 bigint；这里必须也是 bigint（number 会在 `&` 处抛）。 */',
+    'export const PERM: any = new Proxy({}, {',
+    '    get: (t: any, k: string) => (typeof k === "string" && k.startsWith("PERM_") ? 1n << 1n : undefined),',
+    '});',
+    '',
+    '/** 题目模型：测试会直接改这些方法（同一模块实例，改了 oj.ts 里就看得见）。 */',
+    'export const ProblemModel: any = { getMulti: async () => [], get: async () => null };',
+    'export const RecordModel: any = { get: async () => null, getMulti: async () => [] };',
+    'export const ContestModel: any = { getMulti: async () => [] };',
+    'export const DiscussionModel: any = { getMulti: async () => [] };',
+    'export const UserModel: any = { getById: async () => null };',
+    '',
 ].join('\n'));
 
-// handler 层：搬通知 / 硬币 / 签到三个文件，供 test.ts 直接跑
+// handler 层：搬通知 / 硬币 / 签到 / 题目，供 test.ts 直接跑
 // **真实的 handler 代码路径** —— 查询条件对不对、返回体对不对、权限门在不在，都在这里验。
 mkdirSync(join(OUT, 'handler'), { recursive: true });
-for (const f of ['base.ts', 'coin.ts', 'system.ts', 'checkin.ts']) {
+for (const f of ['base.ts', 'coin.ts', 'system.ts', 'checkin.ts', 'oj.ts']) {
     let code = readFileSync(join(SRC, 'handler', f), 'utf8');
     code = code.replaceAll("from 'hydrooj'", "from '../_hydro.ts'");
     for (const dep of ['base', 'coin']) code = code.replaceAll(`from './${dep}'`, `from './${dep}.ts'`);

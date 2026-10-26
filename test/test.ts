@@ -12,7 +12,7 @@ import {
     init, doCheckin, getState, getCalendar, getRank, calcReward,
     issueToken, verifyToken, revokeTokens, listTokens,
     issuePairCode, consumePairCode, coinBalance, grantCoin, diagnose,
-    computeStreak, countBack, longestRun, loadCheckinDays, repairCheckin,
+    computeStreak, countBack, longestRun, loadCheckinDays, repairCheckin, getConfig,
 } from './.build/model.ts';
 import { dateKey, today, prevDay, resolveRecordScope } from './.build/lib.ts';
 // 通知的两个 handler：这里跑的是**真实 handler 代码**（只把 import 路径改写成本机能跑的）
@@ -23,14 +23,16 @@ import {
 import {
     CheckinDoHandler, CheckinStatusHandler, CheckinMakeupHandler, CheckinRepairHandler,
 } from './.build/handler/checkin.ts';
+// 题面直传：跑真 handler，站点侧的 fetch 全部打桩
+import { StatementHandler } from './.build/handler/oj.ts';
 import {
     initPoints, grantCheckinPoints, pointsBalance, TASKS,
 } from './.build/points.ts';
 import {
     unreadFilter, readMark, isReadBy,
 } from './.build/notify.ts';
-// prepare.mjs 生成的 hydrooj 替身（只提供 ObjectId / Handler）—— 批量已读要用真 ObjectId
-import { ObjectId } from './.build/_hydro.ts';
+// prepare.mjs 生成的 hydrooj 替身（只提供 ObjectId / Handler / 模型）—— 批量已读要用真 ObjectId
+import { ObjectId, ProblemModel } from './.build/_hydro.ts';
 
 // ---------------------------------------------------------------- 假存储
 
@@ -972,6 +974,209 @@ async function main() {
 
         // 任务表里的「完成今日打卡」是另一笔，改成 20
         eq('任务表 daily.checkin = 20 分 ★', TASKS.find((t) => t.id === 'daily.checkin')?.points, 20);
+    }
+
+    // =============================================================================================
+    section('21. 题面直传（/client-api/statement）★');
+    {
+        // 直接调 run()：绕过认证（认证另有测试），跑的是**真实的 StatementHandler**
+        const hctx = { db };
+        const callStmt = async (uid: number, params: any = {}, headers: any = {}) => {
+            const h: any = Object.create(StatementHandler.prototype);
+            h.clientUid = uid;
+            h.args = {};
+            h.request = { body: { ...params }, query: {}, headers, ip: '127.0.0.1' };
+            h.response = {};
+            (h as any).ctx = hctx;
+            await h.run();
+            return { status: h.response.status, body: h.response.body };
+        };
+
+        // 反代后的样子：外面 https、里层 http；Host 是站点自己的域名
+        const HOST = { host: 'sanhai.example', 'x-forwarded-proto': 'https' };
+        const BASE = 'https://sanhai.example';
+
+        /** 假的 Response：只要 handler 真的用到的三个东西（status / headers.get / text）。 */
+        const mkRes = (status: number, text = '', location = '') => ({
+            status,
+            headers: { get: (k: string) => (String(k).toLowerCase() === 'location' ? location : null) },
+            text: async () => text,
+        });
+
+        /** 打桩 fetch 并记录调用（用完必须 restoreFetch）。 */
+        const realFetch = (globalThis as any).fetch;
+        const stubFetch = (fn: any) => {
+            const calls: any[] = [];
+            (globalThis as any).fetch = async (url: any, init: any) => {
+                calls.push({ url: String(url), init: init || {} });
+                return fn(String(url), init || {});
+            };
+            return calls;
+        };
+        const restoreFetch = () => { (globalThis as any).fetch = realFetch; };
+
+        /** pdoc 的来源（真 handler 走 ProblemModel，这里换成可控的假实现）。 */
+        const withPdoc = (pdoc: any) => {
+            ProblemModel.getMulti = async (_d: string, q: any) => (
+                pdoc && Number(q?.docId) === Number(pdoc.docId) ? [pdoc] : []
+            );
+            ProblemModel.get = async (_d: string, pid: number) => (
+                pdoc && Number(pid) === Number(pdoc.docId) ? pdoc : null
+            );
+        };
+
+        // 站点真实扫出来的结构（token 藏在 aside 属性里，iframe src 里也有同一个）
+        const TOKEN = 'abc1234567890abc';
+        const PAGE_HTML = '<html><body><aside class="sui-statement" data-statement-token="' + TOKEN + '">'
+            + '<iframe class="sui-statement-frame" src="/sanhai-ui/statement/' + TOKEN + '"></iframe>'
+            + '</aside></body></html>';
+        const STMT_HTML = '<!doctype html><html><body><h1>均分纸牌</h1>'
+            + '题面正文'.repeat(60) + '</body></html>';
+        const PAGE_URL = (pid: number) => `${BASE}/d/system/p/${pid}`;
+        const STMT_URL = `${BASE}/sanhai-ui/statement/${TOKEN}`;
+
+        // ---- (1) pdoc.content 有货 → markdown，且一次网都不上 ----
+        withPdoc({ docId: 2605, title: '均分纸牌', content: '# 均分纸牌\n\n贪心。' });
+        let calls = stubFetch(() => { throw new Error('有 pdoc.content 时不该访问网络'); });
+        let r = await callStmt(5, { pid: 2605 }, HOST);
+        restoreFetch();
+        eq('1) pdoc 有正文 → format=markdown', r.body.format, 'markdown');
+        eq('1) source=pdoc', r.body.source, 'pdoc');
+        eq('1) content 原样返回', r.body.content, '# 均分纸牌\n\n贪心。');
+        eq('1) chars = 正文字符数', r.body.chars, '# 均分纸牌\n\n贪心。'.length);
+        eq('1) 一次 fetch 都没打 ★', calls.length, 0);
+        check('1) cached=false', r.body.cached === false);
+
+        // ---- (2) content 空 → 服务端自取（题目页 → statement 路由）----
+        withPdoc({ docId: 2011, title: '均分纸牌', content: '' });
+        calls = stubFetch((url) => {
+            if (url === PAGE_URL(2011)) return mkRes(200, PAGE_HTML);
+            if (url === STMT_URL) return mkRes(200, STMT_HTML);
+            return mkRes(404, 'nope');
+        });
+        r = await callStmt(5, { pid: 2011 }, HOST);
+        restoreFetch();
+        eq('2) format=html', r.body.format, 'html');
+        eq('2) source=site', r.body.source, 'site');
+        eq('2) title 来自 pdoc', r.body.title, '均分纸牌');
+        eq('2) html 原样返回', r.body.html, STMT_HTML);
+        eq('2) chars = html 长度', r.body.chars, STMT_HTML.length);
+        eq('2) 恰好两次 fetch（页面 + 题面）', calls.length, 2);
+        eq('2) 先取题目页（URL 由 Host 反推）', calls[0].url, PAGE_URL(2011));
+        eq('2) 再取 statement 路由', calls[1].url, STMT_URL);
+        check('2) 两次 UA 都含 OjClient ★（少了它站点直接 403）',
+            calls.every((c) => /OjClient/.test(String(c.init.headers?.['User-Agent']))),
+            JSON.stringify(calls.map((c) => c.init.headers?.['User-Agent'])));
+        check('2) 两次都 redirect:manual（被踢登录时才看得见 Location）',
+            calls.every((c) => c.init.redirect === 'manual'));
+
+        // ---- (3) 四种失败必须给出可区分的 code ----
+        withPdoc({ docId: 3001, title: 'T', content: '' });
+        calls = stubFetch(() => mkRes(302, '', `/login?redirect=${encodeURIComponent('/d/system/p/3001')}`));
+        r = await callStmt(5, { pid: 3001 }, HOST);
+        restoreFetch();
+        eq('3a) 题目页 302 到 /login → login_required', r.body.code, 'login_required');
+        eq('3a) ok=false', r.body.ok, false);
+        check('3a) 停在这一步，没去取题面', calls.length === 1, String(calls.length));
+
+        withPdoc({ docId: 3002, title: 'T', content: '' });
+        calls = stubFetch(() => mkRes(500, 'boom'));
+        r = await callStmt(5, { pid: 3002 }, HOST);
+        restoreFetch();
+        eq('3b) 题目页 500 → site_unreachable', r.body.code, 'site_unreachable');
+        check('3b) 报错里带状态码', /500/.test(String(r.body.error)), String(r.body.error));
+
+        withPdoc({ docId: 3003, title: 'T', content: '' });
+        calls = stubFetch((url) => (url === PAGE_URL(3003) ? mkRes(200, PAGE_HTML) : mkRes(403, 'forbidden')));
+        r = await callStmt(5, { pid: 3003 }, HOST);
+        restoreFetch();
+        eq('3c) 题面路由 403 → statement_blocked', r.body.code, 'statement_blocked');
+        eq('3c) 两次 fetch（拿到 token 才被拒）', calls.length, 2);
+
+        withPdoc({ docId: 3004, title: 'T', content: '' });
+        calls = stubFetch((url) => (url === PAGE_URL(3004) ? mkRes(200, PAGE_HTML)
+            : mkRes(200, '禁止直接访问题面内容')));
+        r = await callStmt(5, { pid: 3004 }, HOST);
+        restoreFetch();
+        eq('3d) 200 但正文是拒绝页 → statement_blocked', r.body.code, 'statement_blocked');
+
+        withPdoc({ docId: 3005, title: 'T', content: '' });
+        calls = stubFetch(() => mkRes(200, '<html><form action="/login" method="post">'
+            + '<input name="uname"><input name="password"></form></html>'));
+        r = await callStmt(5, { pid: 3005 }, HOST);
+        restoreFetch();
+        eq('3e) 200 但正文是登录页 → login_required', r.body.code, 'login_required');
+
+        withPdoc({ docId: 3006, title: 'T', content: '' });
+        calls = stubFetch(() => mkRes(200, '<html><body><p>这题就是没题面</p></body></html>'));
+        r = await callStmt(5, { pid: 3006 }, HOST);
+        restoreFetch();
+        eq('3f) 页面能开但没 token → no_statement', r.body.code, 'no_statement');
+        eq('3f) 没去猜题面地址', calls.length, 1);
+
+        // 页面里**同时**有 password 表单和 token 时，必须以 token 为准（别误判成登录页）
+        withPdoc({ docId: 3007, title: 'T', content: '' });
+        calls = stubFetch((url) => (url === PAGE_URL(3007)
+            ? mkRes(200, '<form action="/login"><input name="password"></form>'
+                + PAGE_HTML.replaceAll(TOKEN, 'tok3007tok3007tok3007'))
+            : mkRes(200, STMT_HTML)));
+        r = await callStmt(5, { pid: 3007 }, HOST);
+        restoreFetch();
+        eq('3g) 有 token 就不当登录页 ★', r.body.source, 'site');
+
+        // ---- (4) 缓存：成功才缓存，失败绝不缓存 ----
+        withPdoc({ docId: 4001, title: '均分纸牌', content: '' });
+        calls = stubFetch((url) => (url === PAGE_URL(4001) ? mkRes(200, PAGE_HTML.replaceAll(TOKEN, 'tok4001tok4001tok4001'))
+            : mkRes(200, STMT_HTML)));
+        const c1 = await callStmt(5, { pid: 4001 }, HOST);
+        eq('4a) 第一次 cached=false', c1.body.cached, false);
+        eq('4a) 第一次打了两趟', calls.length, 2);
+        const c2 = await callStmt(5, { pid: 4001 }, HOST);
+        restoreFetch();
+        eq('4a) 第二次 cached=true ★', c2.body.cached, true);
+        eq('4a) 第二次没再打站点 ★', calls.length, 2);
+        eq('4a) 缓存命中的正文和第一次一致', c2.body.html, c1.body.html);
+
+        withPdoc({ docId: 4002, title: 'T', content: '' });
+        calls = stubFetch(() => mkRes(500, 'boom'));
+        const f1 = await callStmt(5, { pid: 4002 }, HOST);
+        eq('4b) 第一次失败', f1.body.code, 'site_unreachable');
+        eq('4b) 只打了一趟', calls.length, 1);
+        const f2 = await callStmt(5, { pid: 4002 }, HOST);
+        restoreFetch();
+        eq('4b) 第二次仍然失败（失败不缓存）', f2.body.code, 'site_unreachable');
+        eq('4b) 而且**重新打了一次**站点 ★（没被锁死在缓存里）', calls.length, 2);
+
+        // ---- (5) 并发去重：同一题同时来两个请求，只发一趟 ----
+        withPdoc({ docId: 5001, title: '均分纸牌', content: '' });
+        calls = stubFetch(async (url) => {
+            await new Promise((res) => setTimeout(res, 5));
+            return url.includes('/sanhai-ui/statement/')
+                ? mkRes(200, STMT_HTML)
+                : mkRes(200, PAGE_HTML.replaceAll(TOKEN, 'tok5001tok5001tok5001'));
+        });
+        const [b1, b2] = await Promise.all([
+            callStmt(5, { pid: 5001 }, HOST),
+            callStmt(6, { pid: 5001 }, HOST),
+        ]);
+        restoreFetch();
+        eq('5) 两个请求都成功', [b1.body.ok, b2.body.ok], [true, true]);
+        eq('5) 两个请求拿到同一份正文', b1.body.html === b2.body.html, true);
+        eq('5) fetch 只打了一趟（共 2 次 HTTP）★', calls.length, 2);
+
+        // ---- (6) 关掉直传 → 404 ----
+        // ⚠️ 配置是 handler 运行时从 model 读的（getConfig() 返回**活对象**），
+        //    所以这里必须改它，改外面那个 CFG 常量是没用的（init 早就把它换成了 CFG2）。
+        (getConfig() as any).statementProxy = false;
+        withPdoc({ docId: 2605, title: '均分纸牌', content: '# x' });
+        calls = stubFetch(() => { throw new Error('关掉后不该访问网络'); });
+        r = await callStmt(5, { pid: 2605 }, HOST);
+        restoreFetch();
+        delete (getConfig() as any).statementProxy;
+        eq('6) statementProxy=false → 404', r.status, 404);
+        eq('6) ok=false', r.body.ok, false);
+        check('6) 说明是「已关闭」', /已关闭/.test(String(r.body.error)), String(r.body.error));
+        eq('6) 也没打网络', calls.length, 0);
     }
 
     console.log(`\n${'='.repeat(46)}`);

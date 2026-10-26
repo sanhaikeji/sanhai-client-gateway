@@ -14,6 +14,7 @@ import {
 } from 'hydrooj';
 import { ClientApiHandler } from './base';
 import { resolveRecordScope } from '../lib';
+import { getConfig } from '../model';
 
 /**
  * 取某个域下某个用户的权限对象（带 `hasPerm`）。
@@ -59,6 +60,22 @@ async function toArray(x: any): Promise<any[]> {
 }
 
 const domainOf = (h: any) => String(h.domain?._id || 'system');
+
+/**
+ * 取一题的 pdoc。
+ *
+ * <para>题目详情和题面直传**必须用同一条取法** —— 两边各写一份的话，哪天 Hydro 改了
+ * `ProblemModel` 的方法名，就会出现「详情说有题面、直传说没有」这种自相矛盾。</para>
+ *
+ * <para>先按 <c>getMulti</c>（有的版本只有它），失败或没给再退 <c>get</c>；
+ * 两个都没有 / 都抛错时返回 <c>null</c>（调用方自己决定当作什么）。</para>
+ */
+async function loadPdoc(domainId: string, pid: number): Promise<any> {
+    return await toArray(await (ProblemModel as any).getMulti?.(domainId, { docId: pid }))
+        .then((r) => r[0])
+        .catch(() => null)
+        || await (ProblemModel as any).get?.(domainId, pid).catch(() => null);
+}
 
 // ---------------------------------------------------------------- 题目
 
@@ -116,10 +133,7 @@ export class ProblemDetailHandler extends ClientApiHandler {
         const pid = this.intParam('pid', 0);
         if (!pid) { this.fail('缺少题目号 pid'); return; }
 
-        const pdoc = await toArray(await (ProblemModel as any).getMulti?.(domainId, { docId: pid }))
-            .then((r) => r[0])
-            .catch(() => null)
-            || await (ProblemModel as any).get?.(domainId, pid).catch(() => null);
+        const pdoc = await loadPdoc(domainId, pid);
         if (!pdoc) { this.fail('题目不存在', 404); return; }
 
         this.ok({
@@ -129,7 +143,7 @@ export class ProblemDetailHandler extends ClientApiHandler {
             nSubmit: pdoc.nSubmit ?? 0,
             nAccept: pdoc.nAccept ?? 0,
             tags: pdoc.tag || [],
-            // 题面本身（Markdown）可以另外通过 /client-api/problem/statement 取，避免一次拉太多
+            // 题面本身可以另外通过 /client-api/statement 取，避免一次拉太多
             hasStatement: !!pdoc.content,
         });
     }
@@ -150,6 +164,313 @@ export class RandomProblemHandler extends ClientApiHandler {
         } catch {
             this.fail('取随机题目失败');
         }
+    }
+}
+
+// ---------------------------------------------------------------- 题面直传
+
+/**
+ * 服务端自取题面时用的 UA。
+ *
+ * <para>⚠️ 本站的 <c>/sanhai-ui/statement/&lt;token&gt;</c> 有防盗刷：**UA 里不含 <c>OjClient</c>
+ * 就直接 403 + 一句「禁止直接访问题面内容」**（实测；加上 <c> OjClient/1.0 (WinUI3)</c> 即放行）。
+ * 所以这两个请求都必须带它，少了就是一个永远拿不到题面的接口。</para>
+ */
+const STATEMENT_UA = 'OjClient/1.0 (WinUI3)';
+
+/**
+ * 从题目页 HTML 里抽 statement token，**依次**试两条。
+ *
+ * <para>第一条是站点真正写在 <c>&lt;aside&gt;</c> 上的属性；第二条兜底扫 iframe 的 src
+ * （属性名将来改了、但路由形态没变时还能活）。第二条限定 16 位以上，避免把
+ * 静态资源路径里的短串误当 token。</para>
+ */
+const STATEMENT_TOKEN_RES: RegExp[] = [
+    /data-statement-token="([^"]+)"/,
+    /sanhai-ui\/statement\/([A-Za-z0-9_-]{16,})/,
+];
+
+/** 被站点拒绝时正文里必然带的那句（实测 154 字节）。 */
+const STATEMENT_BLOCKED_TEXT = '禁止直接访问题面内容';
+
+/** 缓存条目上限：超了删最旧的一条（Map 按插入顺序迭代）。 */
+const STATEMENT_CACHE_MAX = 200;
+
+type StatementErrorCode = 'no_statement' | 'site_unreachable' | 'statement_blocked' | 'login_required';
+
+interface SiteStatementOk { ok: true; data: any }
+interface SiteStatementFail { ok: false; code: StatementErrorCode; error: string; status: number }
+type SiteStatement = SiteStatementOk | SiteStatementFail;
+
+/** 成功结果的缓存：`domain:pid` → 结果体 + 落库时间。**失败不进这里**（见 cachePut 的注释）。 */
+const statementCache = new Map<string, { at: number; data: any }>();
+
+/**
+ * 同 key 的在途请求。并发的两个请求拿的是**同一个 Promise** ——
+ * 否则「打开题目」时客户端预取 + 用户点题面，两趟都会打站点，等于把缓存做废。
+ */
+const statementInflight = new Map<string, Promise<SiteStatement>>();
+
+function statementTimeout(cfg: any): number {
+    const n = Number(cfg?.statementTimeoutMs);
+    return Number.isFinite(n) && n > 0 ? n : 8000;
+}
+
+/** 缓存秒数；`<= 0` 视为关闭缓存（返回 0）。 */
+function statementTtlMs(cfg: any): number {
+    const n = Number(cfg?.statementCacheSeconds ?? 60);
+    return Number.isFinite(n) && n > 0 ? n * 1000 : 0;
+}
+
+function cacheGet(key: string, ttlMs: number): any {
+    const e = statementCache.get(key);
+    if (!e) return null;
+    if (Date.now() - e.at > ttlMs) { statementCache.delete(key); return null; }
+    return e.data;
+}
+
+/**
+ * 只缓存**成功**。
+ *
+ * <para>⚠️ 失败也缓存的话，站点抽风 1 秒就会让这一题在整整一个 TTL 里都是坏的 ——
+ * 用户重试也没用（这正好是最容易被当成「客户端 bug」的那种故障）。</para>
+ */
+function cachePut(key: string, data: any) {
+    statementCache.set(key, { at: Date.now(), data });
+    while (statementCache.size > STATEMENT_CACHE_MAX) {
+        const oldest = statementCache.keys().next();
+        if (oldest.done) break;
+        statementCache.delete(oldest.value);
+    }
+}
+
+/**
+ * 发一个 GET 并**手工处理重定向**（`redirect: 'manual'`）—— 被踢去登录页时
+ * 我们要看的是 `Location`，跟着跳过去只会拿到一张 200 的登录页，反而判不出来。
+ */
+async function httpGet(url: string, timeoutMs: number, accept?: string): Promise<{
+    status: number; location: string; text: string; error?: string;
+}> {
+    const f: any = (globalThis as any).fetch;
+    if (typeof f !== 'function') {
+        return { status: 0, location: '', text: '', error: '当前运行环境没有 fetch' };
+    }
+    let signal: any;
+    try {
+        signal = typeof AbortSignal !== 'undefined' && (AbortSignal as any).timeout
+            ? (AbortSignal as any).timeout(timeoutMs)
+            : undefined;
+    } catch { signal = undefined; }
+    try {
+        const headers: any = { 'User-Agent': STATEMENT_UA };
+        if (accept) headers.Accept = accept;
+        const res: any = await f(url, { headers, redirect: 'manual', signal });
+        const text = typeof res?.text === 'function' ? String(await res.text()) : '';
+        let location = '';
+        try {
+            location = String(res?.headers?.get?.('location') || (res?.headers as any)?.location || '');
+        } catch { location = ''; }
+        return { status: Number(res?.status) || 0, location, text };
+    } catch (e) {
+        return { status: 0, location: '', text: '', error: (e as Error)?.message || String(e) };
+    }
+}
+
+/** 登录页特征：Hydro 的登录表单 action 指向 /login，正文里必然有密码输入框。 */
+function looksLikeLoginPage(html: string): boolean {
+    return /action=["'][^"']*\/login/i.test(html) || /<input[^>]+name=["']?password/i.test(html);
+}
+
+function extractStatementToken(html: string): string {
+    for (const re of STATEMENT_TOKEN_RES) {
+        const m = re.exec(html);
+        if (m && m[1]) return m[1];
+    }
+    return '';
+}
+
+/**
+ * 顺手取一次题面 HTML。
+ *
+ * <para>两步：先拿题目页（token 是**每次渲染题目页时现发**的，所以必须先取页面），
+ * 再拿 statement 路由。两步都要带 {@link STATEMENT_UA}。</para>
+ *
+ * <para>⚠️ 站点返回的 cookie / 响应头**一律不往外带** —— 这里是服务端代取，
+ * 把站点的会话漏给客户端等于让客户端绕开令牌体系。</para>
+ */
+async function fetchSiteStatement(
+    domainId: string, pid: number, title: string, selfBase: string, timeoutMs: number,
+): Promise<SiteStatement> {
+    const pageUrl = `${selfBase}/d/${domainId}/p/${pid}`;
+    const page = await httpGet(pageUrl, timeoutMs, 'text/html');
+
+    if (page.error) {
+        return { ok: false, code: 'site_unreachable', error: `取题目页失败：${page.error}`, status: 502 };
+    }
+    if (page.status >= 300 && page.status < 400) {
+        // 被踢去登录 = 这题的题面在站点上也不给匿名看；客户端该退回去用网页登录态。
+        if (/\/login/i.test(page.location)) {
+            return {
+                ok: false, code: 'login_required',
+                error: '站点要求登录后才能查看这道题的题面', status: 502,
+            };
+        }
+        return {
+            ok: false, code: 'site_unreachable',
+            error: `取题目页时站点返回了重定向（HTTP ${page.status}）`, status: 502,
+        };
+    }
+    if (page.status < 200 || page.status >= 300) {
+        return {
+            ok: false, code: 'site_unreachable',
+            error: `取题目页失败（HTTP ${page.status}）`, status: 502,
+        };
+    }
+    // ⚠️ 先抽 token、再判「是不是登录页」。
+    //    反过来的话，只要页面模板里恰好藏了一个带 password 的表单（某天改版、或者
+    //    头部弹窗登录），**所有**题面都会被判成 login_required —— 那是最难查的一类故障。
+    //    抓到 token 就说明题目页确实渲染了，直接往下走。
+    const token = extractStatementToken(page.text);
+    // 有的部署不跳转、直接把登录页盖在 200 里（会话过期时常见）
+    if (!token && looksLikeLoginPage(page.text)) {
+        return {
+            ok: false, code: 'login_required',
+            error: '站点返回的是登录页，需要登录后才能查看这道题的题面', status: 502,
+        };
+    }
+    if (!token) {
+        // 题目页能开、但里面没有 token —— 就是这题在站点上也没有题面。
+        return {
+            ok: false, code: 'no_statement',
+            error: '这道题没有题面', status: 404,
+        };
+    }
+
+    const st = await httpGet(`${selfBase}/sanhai-ui/statement/${encodeURIComponent(token)}`, timeoutMs);
+    if (st.error) {
+        return {
+            ok: false, code: 'statement_blocked',
+            error: `取题面失败：${st.error}`, status: 502,
+        };
+    }
+    if (st.status < 200 || st.status >= 300) {
+        return {
+            ok: false, code: 'statement_blocked',
+            error: `题面路由拒绝了这次请求（HTTP ${st.status}）`, status: 502,
+        };
+    }
+    if (st.text.length < 200 || st.text.includes(STATEMENT_BLOCKED_TEXT)) {
+        return {
+            ok: false, code: 'statement_blocked',
+            error: '题面路由返回的是拒绝页（多半是防盗刷或权限）', status: 502,
+        };
+    }
+
+    return {
+        ok: true,
+        data: {
+            pid,
+            title,
+            format: 'html',
+            html: st.text,
+            source: 'site',
+            chars: st.text.length,
+        },
+    };
+}
+
+/**
+ * 题目页所在站点地址（服务端自己访问自己）。
+ *
+ * <para>默认按**当前请求的 Host 反推** —— 这样同一个插件装在不同域名 / 反代后面都不用改配置，
+ * 也不会出现「配的是 A 域名、实际访问的是 B 域名」这种跨站问题。</para>
+ *
+ * <para>⚠️ 反代常常把外面的 <c>https</c> 终结成里面的 <c>http</c>，所以优先认
+ * <c>X-Forwarded-Proto</c>（可能是 <c>https,http</c> 这种逗号列表，取第一个）。</para>
+ */
+function selfBaseOf(h: any): string {
+    const cfg: any = getConfig();
+    const conf = String(cfg?.statementSelfBase || '').trim();
+    if (conf) return conf.replace(/\/+$/, '');
+
+    const req: any = h?.request || {};
+    const headers: any = req.headers || {};
+    const proto = String(
+        headers['x-forwarded-proto'] || (h as any)?.ctx?.protocol || 'https',
+    ).split(',')[0].trim() || 'https';
+    const host = String(headers.host || headers.Host || '');
+    return `${proto}://${host}`;
+}
+
+/**
+ * 题面直传：**客户端不碰站点那个受防盗刷保护的页面**，从这里拿题面。
+ *
+ * <para>两条来源，顺序不能换：</para>
+ * <list type="number">
+ *   <item><b>pdoc.content</b>（原版 Hydro / 代码源题目）—— 有就直接给 markdown，不触网；</item>
+ *   <item><b>站点页</b>（本站 SanhaiOJ：题面不在 pdoc 里，而是 <c>/sanhai-ui/statement/&lt;token&gt;</c>，
+ *         token 每次渲染题目页时现发）—— 服务端自己去取，再把正文原样交出来。</item>
+ * </list>
+ *
+ * <para>失败一定要带 <c>code</c>：客户端靠它在「回退到网页 / 显示占位 / 提示登录」之间选，
+ * 只看 HTTP 状态码是分不出来的（这几种情况都可能是 502）。</para>
+ */
+export class StatementHandler extends ClientApiHandler {
+    protected async run() {
+        const cfg: any = getConfig();
+        if (cfg?.statementProxy === false) { this.fail('题面直传已关闭', 404); return; }
+
+        const pid = this.intParam('pid', 0);
+        if (!pid) { this.fail('缺少题目号 pid'); return; }
+        // `tid`（比赛号）目前只做兼容接收，取哪一页仍按普通题目页走。
+        const domainId = domainOf(this);
+
+        // ---- 1) 先走 pdoc.content ----
+        const pdoc = await loadPdoc(domainId, pid);
+        if (pdoc && typeof pdoc.content === 'string' && pdoc.content.trim()) {
+            this.ok({
+                pid: pdoc.docId ?? pid,
+                title: pdoc.title || '',
+                format: 'markdown',
+                content: pdoc.content,
+                source: 'pdoc',
+                chars: pdoc.content.length,
+                cached: false,
+            });
+            return;
+        }
+        if (!pdoc) { this.fail('题目不存在', 404, { code: 'no_statement' }); return; }
+
+        // ---- 2) 服务端自取（本站） ----
+        const key = `${domainId}:${pid}`;
+        const ttlMs = statementTtlMs(cfg);
+        if (ttlMs > 0) {
+            const hit = cacheGet(key, ttlMs);
+            if (hit) { this.ok({ ...hit, cached: true }); return; }
+        }
+
+        let p = statementInflight.get(key);
+        if (!p) {
+            const timeoutMs = statementTimeout(cfg);
+            const selfBase = selfBaseOf(this);
+            const title = pdoc.title || '';
+            p = fetchSiteStatement(domainId, pid, title, selfBase, timeoutMs)
+                .then((r) => {
+                    if (r.ok && ttlMs > 0) cachePut(key, r.data);
+                    return r;
+                })
+                // 兜底：真抛出来也不能变成 500（客户端只认 code）
+                .catch((e): SiteStatement => ({
+                    ok: false, code: 'site_unreachable',
+                    error: `取题面失败：${(e as Error)?.message || String(e)}`, status: 502,
+                }))
+                .finally(() => { statementInflight.delete(key); });
+            statementInflight.set(key, p);
+        }
+
+        const r = await p;
+        if (!r.ok) { this.fail(r.error, r.status, { code: r.code }); return; }
+        this.ok({ ...r.data, cached: false });
     }
 }
 

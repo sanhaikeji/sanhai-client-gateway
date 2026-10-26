@@ -59,6 +59,10 @@ export class CapabilitiesHandler extends ClientApiHandler {
                 // 服务端支持「按会话清未读 / 批量按 id 清」（`conv=` / `ids=` / `scope`）
                 notificationsReadBy: true,
                 pairLogin: true,
+                // 服务端能代取题面（GET /client-api/statement）。
+                // 客户端据此决定「能不能不自己爬 /sanhai-ui/statement/<token>」；
+                // 关掉直传时这里也是 false，客户端就老老实实走原来的回退路径。
+                statementProxy: cfg.statementProxy !== false,
             },
             checkin: {
                 signedToday: st.lastDate === new Date().toLocaleDateString('en-CA', { timeZone: 'Asia/Shanghai' }),

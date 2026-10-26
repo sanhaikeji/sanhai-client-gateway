@@ -57,6 +57,13 @@ const DEFAULTS = {
     checkinRepairCollection: 'clientgw.checkin_repair',
     tokenCollection: 'clientgw.token',
     pairCollection: 'clientgw.pair',
+    // ---- 题面直传（见 handler/oj.ts 的 StatementHandler）----
+    // 本站（SanhaiOJ）的题面不在 pdoc.content 里，而是 /sanhai-ui/statement/<token>，
+    // 那条路由有防盗刷（UA 必须含 OjClient）。服务端代取一层，客户端就不用碰它。
+    statementProxy: true,
+    statementSelfBase: '',        // 空 = 按当前请求的 Host 反推
+    statementCacheSeconds: 60,    // 0 = 不缓存
+    statementTimeoutMs: 8000,
 };
 
 export const Config = Schema.object({
@@ -98,6 +105,15 @@ export const Config = Schema.object({
         .description('补发记录集合（_id = uid；保证同一个人的历史差额只补一次）'),
     tokenCollection: Schema.string().default('clientgw.token').description('客户端令牌集合'),
     pairCollection: Schema.string().default('clientgw.pair').description('配对码集合'),
+
+    statementProxy: Schema.boolean().default(true)
+        .description('启用题面直传（GET /client-api/statement；关掉后该接口返回 404）'),
+    statementSelfBase: Schema.string().default('')
+        .description('服务端自取题面时用的站点地址（留空 = 按当前请求的 Host 反推，通常不用填）'),
+    statementCacheSeconds: Schema.number().default(60)
+        .description('题面缓存秒数（只缓存成功结果；0 = 关闭缓存）'),
+    statementTimeoutMs: Schema.number().default(8000)
+        .description('自取题面的超时（毫秒），超时按 site_unreachable 处理'),
 });
 
 export async function apply(ctx: Context, config: any = {}) {
@@ -152,6 +168,9 @@ export async function apply(ctx: Context, config: any = {}) {
     R('client_api_problems', '/client-api/problems', H.ProblemsHandler);
     R('client_api_problem', '/client-api/problem', H.ProblemDetailHandler);
     R('client_api_problem_random', '/client-api/problem/random', H.RandomProblemHandler);
+    // 题面直传：客户端不必自己去拉站点那个受防盗刷保护的 /sanhai-ui/statement/<token>。
+    // 先在服务端取（带 OjClient UA + 缓存 + 并发去重），再把正文交给客户端。
+    R('client_api_statement', '/client-api/statement', H.StatementHandler);
 
     // ---------------- 提交
     R('client_api_records', '/client-api/records', H.RecordsHandler);
