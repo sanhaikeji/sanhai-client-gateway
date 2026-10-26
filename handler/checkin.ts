@@ -10,9 +10,10 @@
  * 幂等的物理保证是 `checkin_log` 上 `(uid, date)` 的唯一索引 —— 不是靠代码里的 if。
  */
 import { ClientApiHandler } from './base';
+import { isAdmin } from './coin';
 import {
     getState, doCheckin, getCalendar, getRank, recentLogs, calcReward,
-    coinBalance, grantCoin, getConfig,
+    coinBalance, grantCoin, getConfig, resolveCurrentStreak, repairCheckin,
 } from '../model';
 import { today, yesterday } from '../lib';
 import { grantCheckinPoints } from '../points';
@@ -34,17 +35,20 @@ async function names(ctx: any, uids: number[]): Promise<Record<number, string>> 
 async function buildStatus(ctx: any, uid: number) {
     const st = await getState(uid);
     const t = today();
-    const signed = st.lastDate === t;
-    // 今天签到能拿多少（预览）；如果连续断了，按重新开始算
+    // ⚠️ 连续天数用**流水推出来的值**，不用 state 里可能过期的缓存 ——
+    //    state 只在「这人又签了一次」时才刷新，断签的人看到的会是旧数字。
+    const cur = await resolveCurrentStreak(uid);
+    const signed = cur.lastDate === t;
+    // 今天签了能到多少天：昨天签过就接着数，断了（或从没签过）就从 1 开始
     const willStreak = signed
-        ? st.streak
-        : (st.lastDate === yesterday() ? st.streak + 1 : 1);
+        ? cur.streak
+        : (cur.lastDate === yesterday() ? cur.streak + 1 : 1);
     const preview = calcReward(willStreak);
     const coins = await coinBalance(uid).catch(() => 0);
     return {
         date: t,
         signed,
-        streak: st.streak,
+        streak: cur.streak,
         maxStreak: st.maxStreak,
         totalDays: st.totalDays,
         totalReward: st.totalReward,
@@ -114,7 +118,7 @@ export class CheckinRulesHandler extends ClientApiHandler {
             })),
             makeupCost: Number(cfg.makeupCost ?? 5),
             makeupWindow: Number(cfg.makeupWindow ?? 3),
-            makeupReward: Number(cfg.makeupReward ?? 0),
+            makeupReward: Number(cfg.makeupReward ?? 1),
             timezone: 'Asia/Shanghai',
         });
     }
@@ -182,6 +186,45 @@ export class CheckinMakeupHandler extends ClientApiHandler {
             await grantCoin(this.clientUid, cost, `补签失败退还 ${date}`).catch(() => {});
             this.fail('那天已经签过了，费用已退回'); return;
         }
-        this.ok({ ...r, cost, message: `补签 ${date} 成功，花费 ${cost} 硬币` });
+        this.ok({
+            ...r,
+            cost,
+            // 文案里要把**实发**的硬币数说清楚，否则「花了 5 币」看起来像纯亏
+            message: `补签 ${date} 成功，花费 ${cost} 硬币，`
+                + `获得 ${r.reward} 硬币${r.bonusLabel ? `（${r.bonusLabel}）` : ''}`,
+        });
+    }
+}
+
+// ---------------------------------------------------------------- 历史补发（管理员，默认 dry-run）
+
+/**
+ * `POST /client-api/checkin/repair`
+ *
+ * 参数（全走 query）：
+ *   - `dry`   默认 **1** = 只体检、不写库不发钱；`dry=0` 才真补；
+ *   - `uid`   可选，只修一个人；
+ *   - `force` 1 = 忽略「已补发过」的记录，重补一次。
+ *
+ * ⚠️ 非管理员一律 403 —— 这个接口会动真钱。
+ */
+export class CheckinRepairHandler extends ClientApiHandler {
+    protected async run() {
+        const cfg: any = getConfig();
+        if (!isAdmin(cfg, this.clientUid)) { this.fail('只有管理员能执行补发', 403); return; }
+
+        // dry 默认 1：会真发硬币的接口，不该因为少打一个参数就把钱发出去
+        const dry = String(this.param('dry', '1')) !== '0';
+        const force = String(this.param('force', '0')) === '1';
+        const uid = this.intParam('uid', 0);
+
+        const r = await repairCheckin({ dry, force, uid: uid > 0 ? uid : 0 });
+        this.ok({
+            ...r,
+            message: dry
+                ? `体检完成：${r.scanned} 人里 ${r.affected} 人有差额，共应补 ${r.totalCoins} 硬币`
+                  + '（dry=1，未写库、未发钱）'
+                : `补发完成：${r.affected} 人有差额，本次实发 ${r.totalPaid} 硬币`,
+        });
     }
 }

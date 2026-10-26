@@ -6,7 +6,7 @@
  *   1) `import { ObjectId } from 'mongodb'` —— 插件装在 ~/.hydro/addons/ 下时，
  *      从那里往上找不到 mongodb 的 node_modules，require 直接抛错；
  *      而 Hydro 的三个加载器**共用同一个 fail 列表**，一个文件炸了，
- *      整个插件的 index.ts（42 条路由）都会被跳过 → 表现成**全部 404**。
+ *      整个插件的 index.ts（43 条路由）都会被跳过 → 表现成**全部 404**。
  *   2) `import { TokenInfo } from '../model'` —— TokenInfo 是 interface，
  *      当值导入在 ESM 下是硬错误（does not provide an export named）。
  * 这两类只有**真 import 一遍**才能发现，所以有了这个测试。
@@ -141,8 +141,8 @@ try {
 
 console.log('注册到的路由：');
 for (const r of routes) console.log('  ' + r.path);
-if (routes.length !== 42) {
-    console.error(`\n✗ 期望 42 条路由，实际 ${routes.length} 条`);
+if (routes.length !== 43) {
+    console.error(`\n✗ 期望 43 条路由，实际 ${routes.length} 条`);
     process.exit(1);
 }
 console.log(`\n✓ 插件加载成功，注册了 ${routes.length} 条路由`);

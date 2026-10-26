@@ -177,7 +177,8 @@ Authorization: Bearer <token>
 | GET | `/client-api/checkin/calendar` | `month=2026-10` | 月历（每天签没签） |
 | GET | `/client-api/checkin/rank` | `by=streak\|total`, `limit` | 排行 |
 | GET | `/client-api/checkin/logs` | `limit` | 最近签到明细 |
-| POST | `/client-api/checkin/makeup` | `date=2026-10-10` | 补签（花硬币） |
+| POST | `/client-api/checkin/makeup` | `date=2026-10-10` | 补签（花硬币，**计入连续天数**） |
+| POST | `/client-api/checkin/repair` | `dry=1, uid, force` | **管理员**：历史少发补发（默认只体检） |
 
 **`rules` 返回**（客户端用它渲染「连签 7 天得 5 币」这类提示）
 
@@ -189,7 +190,7 @@ Authorization: Bearer <token>
     { "day": 3,  "coins": 2, "label": "连续 3 天",  "repeat": false },
     { "day": 7,  "coins": 5, "label": "连续 7 天",  "repeat": false }
   ],
-  "makeupCost": 5, "makeupWindow": 3, "makeupReward": 0,
+  "makeupCost": 5, "makeupWindow": 3, "makeupReward": 1,
   "timezone": "Asia/Shanghai"
 }
 ```
@@ -205,7 +206,7 @@ Authorization: Bearer <token>
   "ok": true,
   "date": "2026-10-11",
   "signed": false,               // 今天签没签
-  "streak": 6,                   // 当前连续
+  "streak": 6,                   // 当前连续（从流水推出来的，不是缓存值）
   "maxStreak": 12,
   "totalDays": 48,
   "totalReward": 96,
@@ -216,6 +217,13 @@ Authorization: Bearer <token>
 }
 ```
 
+> ⚠️ **`streak` 的三种语义**（客户端别自己再算一遍）：
+> - 今天签过 → 数到今天；
+> - 只签了昨天 → 链**还活着**，返回数到昨天的连续（明天签就能续上，`todayStreakIfSign` = 它 + 1）；
+> - 更早 → 链**已断**，返回 `0`，`todayStreakIfSign` = 1。
+>
+> `streak = 0` 是「断了」的诚实表示，不是 bug。
+
 **`POST /checkin` 返回**
 
 ```jsonc
@@ -225,14 +233,72 @@ Authorization: Bearer <token>
   "base": 1, "bonus": 5, "bonusLabel": "连续 7 天",
   "totalDays": 49, "totalReward": 102,
   "already": false,
-  "message": "签到成功！连续 7 天，获得 6 硬币（连续 7 天）",
+  "points": 100,                 // 同时发的客户端积分（和硬币是两套货币）
+  "pointsBalance": 1340,
+  "message": "签到成功！连续 7 天，获得 6 硬币（连续 7 天），另有 100 客户端积分",
   "status": { /* 同 status 接口 */ }
 }
 ```
 
-> 重复签到**不是错误**：返回 `already: true`、`reward: 0`，HTTP 仍是 200。客户端好写。
+> 重复签到**不是错误**：返回 `already: true`、`reward: 0`、`points: 0`，HTTP 仍是 200。客户端好写。
 >
-> 上面的数字只是示例，**以 `/client-api/checkin/rules` 为准**。
+> **打卡积分**（`points`，不是硬币）：第 1 天 `checkinPoints` = 100，之后每天 +
+> `checkinPointsPerDay` = 10，加成封顶 `checkinPointsCap` = 200 ——
+> 即连签 1 / 5 / 30 天分别得 **100 / 140 / 300**。三个值都能在插件配置里改。
+> 幂等键是 `checkin:<uid>:<日期>`，一天只发一次，重复打卡拿不到第二份。
+>
+> 上面的硬币数字只是示例，**以 `/client-api/checkin/rules` 为准**。
+
+**补签语义（`POST /checkin/makeup`）**
+
+```jsonc
+{ "ok": true, "date": "2026-10-10", "cost": 5, "reward": 1,
+  "message": "补签 2026-10-10 成功，花费 5 硬币，获得 1 硬币" }
+```
+
+补签**和正常签到一样计入连续天数**，奖励也按**那一天**的连续数算：
+
+- 补签那天算出来的连续数达到里程碑（如第 7 天），**照样给里程碑奖励**；
+- 所以「连 5 天 → 断 1 天 → 今天签（streak 归 1）→ 补签断的那天」之后，
+  当前连续会立刻变成 **7** —— 链子接得回来，不会永远停在 1；
+- 补签本身发当天基础硬币（`makeupReward`，默认 1，与 `dailyCoins` 同值），
+  不再是「扣 5 币换 0 币」；
+- 只能补最近 `makeupWindow` 天（默认 3）且不能补今天；那天已经签过会**退费**并报错。
+
+**`POST /client-api/checkin/repair`（管理员，默认只体检）**
+
+参数全部走 query：
+
+| 参数 | 默认 | 说明 |
+|---|---|---|
+| `dry` | **`1`** | `1` = 只体检，**不写库、不发钱**；`0` = 真补 |
+| `uid` | 全部 | 只修这一个人 |
+| `force` | `0` | `1` = 忽略「已补发过」的记录，重补一次 |
+
+做什么：把每个人**全部签到流水**按日期升序重算
+`streak_i = 该日连续天数` → `expected_i = calcReward(streak_i, makeup_i)`，
+`expected = Σexpected_i`、`actual = Σreward_i`，只处理 `diff = expected - actual > 0` 的人。
+`dry=0` 时走 `grantCoin(uid, diff, '补签连续天数修正补发')`（同时涨 `coin_now` / `coin_all` 并写账单），
+并把 state 的 `lastDate` / `streak` / `maxStreak` / `totalReward` 按流水重算、`totalDays` 取流水条数。
+
+幂等：`clientgw.checkin_repair` 里 `_id = uid` 记一笔，已补过就跳过（`force=1` 才重来）。
+
+```jsonc
+{
+  "ok": true, "dry": true,
+  "scanned": 128, "affected": 9, "totalCoins": 73, "totalPaid": 0,
+  "users": [
+    { "uid": 1234, "days": 40, "endStreak": 7,
+      "expected": 88, "actual": 15, "diff": 73, "paid": 0 }
+  ],
+  "usersTruncated": false,
+  "message": "体检完成：128 人里 9 人有差额，共应补 73 硬币（dry=1，未写库、未发钱）"
+}
+```
+
+> 明细最多 50 条，超了置 `usersTruncated: true`（汇总数字仍是全量）。
+> `totalCoins` = **应补总额**（`dry=1` 时就是「真发会发多少」），`totalPaid` = 本次实发。
+> 非管理员直接 `403`。
 
 ---
 
@@ -342,9 +408,11 @@ POST /client-api/submit
 
 ```
 1. GET  /client-api/checkin/status             看 signed
-2. POST /client-api/checkin                    签
+2. POST /client-api/checkin                    签（返回 reward 硬币 + points 积分）
 3. 拿着返回的 reward 播个动画
 4. GET  /client-api/checkin/rank?by=streak     顺便看看名次
+5. 漏签了 → POST /client-api/checkin/makeup?date=YYYY-MM-DD
+   （花 makeupCost 硬币；**计入连续天数**，补完 status.streak 立刻接上）
 ```
 
 **做题**
@@ -358,7 +426,7 @@ POST /client-api/submit
 
 ---
 
-## 10. 全部接口速查（35 个）
+## 10. 全部接口速查（43 个）
 
 ```
 系统     GET  /client-api/ping
@@ -376,6 +444,10 @@ POST /client-api/submit
         POST /client-api/auth/revoke
         POST /client-api/auth/logout
 
+我的    GET  /client-api/me
+        GET  /client-api/me/stats
+        GET  /client-api/perms
+
 签到    GET  /client-api/checkin/status
         POST /client-api/checkin
         GET  /client-api/checkin/rules
@@ -383,9 +455,7 @@ POST /client-api/submit
         GET  /client-api/checkin/rank
         GET  /client-api/checkin/logs
         POST /client-api/checkin/makeup
-
-我的    GET  /client-api/me
-        GET  /client-api/me/stats
+        POST /client-api/checkin/repair           (管理员，默认 dry-run)
 
 题目    GET  /client-api/problems
         GET  /client-api/problem
@@ -403,4 +473,11 @@ POST /client-api/submit
         GET  /client-api/coin/bill
         GET  /client-api/coin/rank
         POST /client-api/coin/inc             (管理员)
+
+积分    GET  /client-api/points
+        GET  /client-api/points/board
+        POST /client-api/points/gift
+        POST /client-api/points/grant         (管理员)
+        GET  /client-api/tasks
+        POST /client-api/tasks/claim
 ```

@@ -34,7 +34,13 @@ const DEFAULTS = {
     ],
     makeupCost: 5,
     makeupWindow: 3,
-    makeupReward: 0,
+    // 补签也给「当天基础硬币」。默认 1 = 和 dailyCoins 同值 ——
+    // 原来是 0，等于「扣 5 币换来 0 币」，补签纯亏，功能是废的。
+    makeupReward: 1,
+    // 打卡发的客户端积分（站点硬币之外的另一套）
+    checkinPoints: 100,          // 第 1 天
+    checkinPointsPerDay: 10,     // 之后每天加这个数
+    checkinPointsCap: 200,       // 连续加成封顶（基础分照给 → 最高 300）
     coinEnabled: true,
     coinUserCollection: 'user',
     coinUserField: 'coin_now',      // SanhaiOJ 上 coin-33oj 用的字段（自检实测）
@@ -48,6 +54,7 @@ const DEFAULTS = {
     adminUids: [5],
     checkinCollection: 'clientgw.checkin',
     checkinLogCollection: 'clientgw.checkin_log',
+    checkinRepairCollection: 'clientgw.checkin_repair',
     tokenCollection: 'clientgw.token',
     pairCollection: 'clientgw.pair',
 };
@@ -66,7 +73,12 @@ export const Config = Schema.object({
     })).default(DEFAULTS.streakBonus).description('连续签到奖励（可加多条）'),
     makeupCost: Schema.number().default(5).description('补签消耗的硬币'),
     makeupWindow: Schema.number().default(3).description('最多可补最近几天（0 = 关闭补签）'),
-    makeupReward: Schema.number().default(0).description('补签本身给多少硬币（一般填 0）'),
+    makeupReward: Schema.number().default(1)
+        .description('补签本身给多少硬币（默认 1 = 和每日基础硬币同值；补签同样计入连续天数）'),
+
+    checkinPoints: Schema.number().default(100).description('打卡发多少客户端积分（连续第 1 天）'),
+    checkinPointsPerDay: Schema.number().default(10).description('之后每多连 1 天多给多少积分'),
+    checkinPointsCap: Schema.number().default(200).description('连续加成封顶（基础分照给，所以最高 = 基础 + 封顶）'),
 
     coinEnabled: Schema.boolean().default(true).description('启用硬币发放与读取'),
     coinUserCollection: Schema.string().default('user').description('存硬币数量的集合'),
@@ -82,6 +94,8 @@ export const Config = Schema.object({
 
     checkinCollection: Schema.string().default('clientgw.checkin').description('签到状态集合'),
     checkinLogCollection: Schema.string().default('clientgw.checkin_log').description('签到流水集合'),
+    checkinRepairCollection: Schema.string().default('clientgw.checkin_repair')
+        .description('补发记录集合（_id = uid；保证同一个人的历史差额只补一次）'),
     tokenCollection: Schema.string().default('clientgw.token').description('客户端令牌集合'),
     pairCollection: Schema.string().default('clientgw.pair').description('配对码集合'),
 });
@@ -131,6 +145,8 @@ export async function apply(ctx: Context, config: any = {}) {
     R('client_api_checkin_rank', '/client-api/checkin/rank', H.CheckinRankHandler);
     R('client_api_checkin_logs', '/client-api/checkin/logs', H.CheckinLogsHandler);
     R('client_api_checkin_makeup', '/client-api/checkin/makeup', H.CheckinMakeupHandler);
+    // 历史补发（管理员，默认 dry-run）—— 修的是「连续天数算错」遗留的少发
+    R('client_api_checkin_repair', '/client-api/checkin/repair', H.CheckinRepairHandler);
 
     // ---------------- 题目
     R('client_api_problems', '/client-api/problems', H.ProblemsHandler);

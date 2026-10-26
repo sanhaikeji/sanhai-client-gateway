@@ -7,7 +7,7 @@
 import { ObjectId } from 'hydrooj';   // 见 index.ts 顶部注释：别直接 import 'mongodb'
 import type { Context } from 'hydrooj';
 import {
-    today, prevDay, newToken, hashToken, newPairCode,
+    today, yesterday, dateKey, prevDay, newToken, hashToken, newPairCode,
 } from './lib';
 
 // ---------------------------------------------------------------- 集合
@@ -15,6 +15,7 @@ import {
 let _ctx: Context;
 let checkinColl: any;
 let checkinLogColl: any;
+let repairColl: any;
 let tokenColl: any;
 let pairColl: any;
 
@@ -26,6 +27,8 @@ export function init(ctx: Context, config: any) {
     cfg = config || {};
     checkinColl = ctx.db.collection(cfg.checkinCollection || 'clientgw.checkin');
     checkinLogColl = ctx.db.collection(cfg.checkinLogCollection || 'clientgw.checkin_log');
+    // 补发记录：`_id = uid`，用来保证「同一个人的历史差额只补一次」
+    repairColl = ctx.db.collection(cfg.checkinRepairCollection || 'clientgw.checkin_repair');
     tokenColl = ctx.db.collection(cfg.tokenCollection || 'clientgw.token');
     pairColl = ctx.db.collection(cfg.pairCollection || 'clientgw.pair');
 
@@ -173,6 +176,98 @@ export async function getState(uid: number): Promise<CheckinState> {
     } : { uid, lastDate: '', streak: 0, maxStreak: 0, totalDays: 0, totalReward: 0 };
 }
 
+// ---------------------------------------------------------------- 连续天数（流水是唯一真值源）
+//
+// ⚠️ 为什么不再信 `state.streak`：老实现只拿 `state.lastDate` 一个字段比对，
+//    于是「断一天 → 今天签 → 再补签断的那天」这条链**永远接不回来**
+//    （补签那支直接 `streak = state.streak` 抄当前值），`lastDate` 还是
+//    `max(state.lastDate, date)` 那种凑合写法，补签根本挪不动它。
+//    用户原话：「签到补签连续签到还是会重新计算」。
+//
+//    现在**只有 `checkin_log` 算数**：一个人签过哪些天是不会骗人的，
+//    state 里的 `streak` / `lastDate` 只是它的缓存（可以随时重算出来）。
+
+/** 回看多少天的流水来数连续。400 天足够覆盖任何真实连签，也不必全表扫。 */
+const STREAK_SPAN_DAYS = 400;
+
+/** 读某 uid 的签到日期集合（可限定区间），给「往回数连续」用。 */
+export async function loadCheckinDays(
+    uid: number, opts: { from?: string; to?: string } = {},
+): Promise<Set<string>> {
+    const q: any = { uid };
+    if (opts.from || opts.to) {
+        q.date = {};
+        if (opts.from) q.date.$gte = opts.from;
+        if (opts.to) q.date.$lte = opts.to;
+    }
+    const rows = await checkinLogColl.find(q).sort({ date: 1 }).toArray();
+    return new Set(rows.map((r: any) => r.date));
+}
+
+/**
+ * 从日期集合往回数连续天数：`upto` 当天没签就是 0。
+ *
+ * <para>纯函数（不碰库）—— 所以 repair 那种「要算历史上每一天的连续数」的场合
+ * 可以用**一份 Set 算完全部**，不必一天发一次查询。</para>
+ */
+export function countBack(days: Set<string>, upto: string): number {
+    let n = 0;
+    let d = upto;
+    while (days.has(d)) { n += 1; d = prevDay(d); }
+    return n;
+}
+
+/** 日期集合里最长的一段连续 —— 也就是「历史最大连签」。 */
+export function longestRun(days: Set<string>): number {
+    const sorted = [...days].sort();   // YYYY-MM-DD 的字典序 = 时间序
+    let best = 0;
+    let run = 0;
+    let prev = '';
+    for (const d of sorted) {
+        run = (prev && prevDay(d) === prev) ? run + 1 : 1;
+        if (run > best) best = run;
+        prev = d;
+    }
+    return best;
+}
+
+/** 从签到流水算出「截至 upto 这一天」的连续天数（补签日一样计入）。 */
+export async function computeStreak(uid: number, upto: string): Promise<number> {
+    const days = await loadCheckinDays(uid, {
+        from: dateKey(new Date(), -STREAK_SPAN_DAYS), to: upto,
+    });
+    return countBack(days, upto);
+}
+
+/**
+ * 当前的连续天数（相对「今天」）。
+ *
+ * <para>三种情况要分清楚，别糊成一种：</para>
+ * <list>
+ *   <item>最晚签到日 = 今天 → 数到今天的连续；</item>
+ *   <item>最晚签到日 = 昨天 → 链**还活着**（今天签就能续上），数到昨天；</item>
+ *   <item>更早 → 链**已断**，诚实给 0。</item>
+ * </list>
+ *
+ * <para>⚠️ `streak = 0` 是「断了」的诚实表示，别为了界面好看保留旧值 ——
+ * 留着旧值正是「补签后连续天数还是勾不回来」的根源。签到后它自然变 1。</para>
+ */
+export async function resolveCurrentStreak(
+    uid: number, days?: Set<string>,
+): Promise<{ lastDate: string; streak: number }> {
+    const set = days || await loadCheckinDays(uid, {
+        from: dateKey(new Date(), -STREAK_SPAN_DAYS),
+    });
+    const t = today();
+    let lastDate = '';
+    for (const d of set) if (d <= t && d > lastDate) lastDate = d;
+    if (!lastDate) return { lastDate: '', streak: 0 };
+    if (lastDate === t || lastDate === yesterday()) {
+        return { lastDate, streak: countBack(set, lastDate) };
+    }
+    return { lastDate, streak: 0 };
+}
+
 /** 计算某一次签到（含补签）该发多少硬币。规则由配置决定。 */
 export function calcReward(streak: number, makeup = false): { base: number; bonus: number; total: number; bonusLabel: string } {
     const base = makeup ? Number(cfg.makeupReward ?? 0) : Number(cfg.dailyCoins ?? 1);
@@ -214,79 +309,225 @@ export interface CheckinResult {
 }
 
 /**
+ * 重复签到（含并发输了的那一方）的返回：顺手把 state 里的连续字段修成流水真值。
+ *
+ * <para>⚠️ 这里**只修 `lastDate` / `streak` / `maxStreak`**，不动 `totalDays` /
+ * `totalReward`。理由：那两个走 `$inc` 维护，本来就没错；若在这里按流水重写，
+ * 会和「并发成功的那个请求」的 `$inc` 抢写，把总天数少算 1。
+ * 历史累计值真要修，那是 {@link repairCheckin} 的活（管理员、默认 dry-run）。</para>
+ */
+async function alreadyCheckin(uid: number, date: string): Promise<CheckinResult> {
+    const days = await loadCheckinDays(uid, { from: dateKey(new Date(), -STREAK_SPAN_DAYS) });
+    const cur = await resolveCurrentStreak(uid, days);
+    const state = await getState(uid);
+    await checkinColl.updateOne({ _id: uid }, {
+        $set: {
+            lastDate: cur.lastDate,
+            streak: cur.streak,
+            maxStreak: Math.max(state.maxStreak || 0, longestRun(days), cur.streak),
+            updatedAt: new Date(),
+        },
+    }, { upsert: true });
+    return {
+        date, streak: cur.streak, reward: 0, base: 0, bonus: 0, bonusLabel: '',
+        totalDays: state.totalDays, totalReward: state.totalReward, already: true,
+    };
+}
+
+/**
  * 执行签到。
  *
- * ⚠️ 顺序很重要：**先插流水（靠唯一索引兜底），再更新状态、再发硬币**。
+ * <para>⚠️ 顺序很重要：**先插流水（靠唯一索引兜底），再算连续天数、再更新状态、再发硬币**。
  * 反过来会有窗口期让并发请求重复发币。检查过 `already` 之后再发币也一样不行 ——
- * 两个请求可能同时通过检查。
+ * 两个请求可能同时通过检查。</para>
+ *
+ * <para>连续天数一律从流水推（{@link computeStreak}），奖励也按**那一天**的连续数算 ——
+ * 所以补签同样能吃到那天的连签里程碑奖励，链子接得回来。</para>
  */
 export async function doCheckin(uid: number, opts: { makeup?: boolean; date?: string } = {}): Promise<CheckinResult> {
     const date = opts.date || today();
     const makeup = !!opts.makeup;
 
-    // 快速路径：今天签过就直接返回
-    const exist = await checkinLogColl.findOne({ uid, date });
-    const state = await getState(uid);
-    if (exist) {
-        return {
-            date, streak: state.streak, reward: 0, base: 0, bonus: 0, bonusLabel: '',
-            totalDays: state.totalDays, totalReward: state.totalReward, already: true,
-        };
-    }
+    // 快速路径：这天签过就直接返回（顺带把状态修成真值，幂等、不多发币）
+    if (await checkinLogColl.findOne({ uid, date })) return alreadyCheckin(uid, date);
 
-    // 计算连续天数：只有「前一天签过」才累加，否则从 1 重新开始。
-    // ⚠️ 用 prevDay(date) 而不是 yesterday()：这样传入任意日期（补签、测试）
-    //    都能算对，也不会被服务器时钟带偏。
-    let streak = 1;
-    if (!makeup) {
-        if (state.lastDate === prevDay(date)) streak = state.streak + 1;
-        else if (state.lastDate === date) streak = state.streak;
-    } else {
-        streak = state.streak;   // 补签不改变当前连续
-    }
-
-    const { base, bonus, total, bonusLabel } = calcReward(streak, makeup);
-
-    // 1) 流水（唯一索引 = 幂等的物理保证）
+    // 1) 流水（唯一索引 = 幂等的物理保证）。
+    //    先插一条占位的：下面的连续天数要**包含这一天**才算得对
+    //    （否则得自己拼「前一天数 + 1」，两套算法迟早算岔）。
     try {
         await checkinLogColl.insertOne({
-            uid, date, ts: new Date(), streak, reward: total, makeup,
+            uid, date, ts: new Date(), streak: 1, reward: 0, makeup,
         });
     } catch (e) {
-        if (isDup(e)) {
-            const s2 = await getState(uid);
-            return {
-                date, streak: s2.streak, reward: 0, base: 0, bonus: 0, bonusLabel: '',
-                totalDays: s2.totalDays, totalReward: s2.totalReward, already: true,
-            };
-        }
+        if (isDup(e)) return alreadyCheckin(uid, date);
         throw e;
     }
 
-    // 2) 更新状态
-    const nextStreak = makeup ? state.streak : streak;
+    // 2) 连续天数从流水推 → 这一天的奖励按这一天的连续数算
+    //    （补签日一样享受里程碑奖励，这是有意的：补签就是为了把链接回来）
+    const dayStreak = await computeStreak(uid, date);
+    const { base, bonus, total, bonusLabel } = calcReward(dayStreak, makeup);
+    await checkinLogColl.updateOne({ uid, date }, { $set: { streak: dayStreak, reward: total } });
+
+    // 3) 状态：lastDate = 该 uid 最晚签到日（不是 `max(state.lastDate, date)` 那种凑合写法），
+    //    streak / maxStreak 全按流水推。maxStreak 和旧值取大 —— 历史上更长的链不能被窗口截断。
+    const days = await loadCheckinDays(uid, {
+        from: dateKey(new Date(), -STREAK_SPAN_DAYS),
+        to: date > today() ? date : today(),
+    });
+    const cur = await resolveCurrentStreak(uid, days);
+    const state = await getState(uid);
+    const maxStreak = Math.max(state.maxStreak || 0, longestRun(days), cur.streak);
     await checkinColl.updateOne({ _id: uid }, {
         $set: {
-            lastDate: state.lastDate && state.lastDate > date ? state.lastDate : date,
-            streak: nextStreak,
-            maxStreak: Math.max(state.maxStreak, nextStreak),
+            lastDate: cur.lastDate || date,
+            streak: cur.streak,
+            maxStreak,
             updatedAt: new Date(),
         },
         $inc: { totalDays: 1, totalReward: total },
     }, { upsert: true });
 
-    // 3) 发硬币（失败不回滚签到 —— 宁可少发一次，也不要「扣了流水又发不出币」）
+    // 4) 发硬币（失败不回滚签到 —— 宁可少发一次，也不要「扣了流水又发不出币」）
     if (total > 0 && cfg.coinEnabled !== false) {
         try {
-            await grantCoin(uid, total, makeup ? `补签 ${date}` : `签到（连续 ${nextStreak} 天）`);
+            await grantCoin(uid, total, makeup ? `补签 ${date}` : `签到（连续 ${dayStreak} 天）`);
         } catch (e) {
             ctx().logger?.error?.(`[clientgw] 发硬币失败 uid=${uid} amount=${total}: ${(e as Error).message}`);
         }
     }
 
     return {
-        date, streak: nextStreak, reward: total, base, bonus, bonusLabel,
+        date, streak: dayStreak, reward: total, base, bonus, bonusLabel,
         totalDays: state.totalDays + 1, totalReward: state.totalReward + total,
+    };
+}
+
+// ---------------------------------------------------------------- 历史补发（管理员，默认 dry-run）
+
+export interface RepairUser {
+    uid: number;
+    /** 流水条数 */
+    days: number;
+    /** 截至最后一个签到日的连续天数 */
+    endStreak: number;
+    /** 按流水重算的应得总额 */
+    expected: number;
+    /** 流水里记着的实发总额 */
+    actual: number;
+    diff: number;
+    /** 本次真正补发的硬币（dry / 已补过 / 差额 ≤ 0 时都是 0） */
+    paid: number;
+}
+
+export interface RepairResult {
+    dry: boolean;
+    /** 体检了多少个 uid */
+    scanned: number;
+    /** 有差额、需要处理的 uid 数 */
+    affected: number;
+    /** 应补总额（dry=1 时就是「如果真发会发多少」） */
+    totalCoins: number;
+    /** 本次实际补发总额 */
+    totalPaid: number;
+    users: RepairUser[];
+    usersTruncated: boolean;
+}
+
+/**
+ * 把「连续天数算错」造成的历史少发补上。
+ *
+ * <para>默认 **dry = true（只体检、不发钱）**。这是个会真发硬币的运维接口，
+ * 不该因为少打一个参数就把钱发出去。</para>
+ *
+ * <para>⚠️ 补发必须走 {@link grantCoin}：它同时涨 `coin_now` 和 `coin_all` 并写账单。
+ * 自己 `$inc` 一个字段看起来更省事，但那样硬币榜（按 `coin_all` 筛人）和账单页都会对不上。</para>
+ *
+ * <para>幂等：`clientgw.checkin_repair` 里 `_id = uid` 记一笔，已经补过就跳过；
+ * 要重来必须显式 `force = 1`。</para>
+ */
+export async function repairCheckin(
+    opts: { dry?: boolean; force?: boolean; uid?: number } = {},
+): Promise<RepairResult> {
+    const dry = opts.dry !== false;
+    const force = !!opts.force;
+    const only = Number(opts.uid || 0);
+
+    // 一次把流水全捞回来：管理员手动触发的运维接口，不常跑；
+    // 比「每人查一次 + 每天再查一次」快几个数量级。
+    const rows = await checkinLogColl.find(only ? { uid: only } : {}).sort({ date: 1 }).toArray();
+    const byUid = new Map<number, any[]>();
+    for (const r of rows) {
+        const arr = byUid.get(r.uid);
+        if (arr) arr.push(r);
+        else byUid.set(r.uid, [r]);
+    }
+
+    const users: RepairUser[] = [];
+    let scanned = 0;
+    let affected = 0;
+    let totalCoins = 0;
+    let totalPaid = 0;
+
+    for (const [uid, list] of byUid) {
+        scanned += 1;
+        // 一份 Set 算完这个人的每一天，不再查库
+        const days = new Set(list.map((r: any) => r.date));
+        let expected = 0;
+        let actual = 0;
+        for (const r of list) {
+            expected += calcReward(countBack(days, r.date), !!r.makeup).total;
+            actual += Number(r.reward || 0);
+        }
+        const diff = expected - actual;
+        if (diff <= 0) continue;   // 没差额 = 不用动
+
+        affected += 1;
+        totalCoins += diff;
+        const row: RepairUser = {
+            uid,
+            days: list.length,
+            endStreak: countBack(days, list[list.length - 1].date),
+            expected, actual, diff, paid: 0,
+        };
+
+        if (!dry) {
+            // (a) state 修成流水真值 —— 幂等，重复跑结果一样，所以放在「发钱」之前
+            const cur = await resolveCurrentStreak(uid, days);
+            await checkinColl.updateOne({ _id: uid }, {
+                $set: {
+                    lastDate: cur.lastDate,
+                    streak: cur.streak,
+                    maxStreak: longestRun(days),
+                    totalDays: list.length,
+                    totalReward: expected,
+                    updatedAt: new Date(),
+                },
+            }, { upsert: true });
+
+            // (b) 发钱：一个 uid 只补一次，force=1 才允许重来
+            const done = await repairColl.findOne({ _id: uid });
+            if (!done || force) {
+                await grantCoin(uid, diff, '补签连续天数修正补发');
+                row.paid = diff;
+                totalPaid += diff;
+                await repairColl.updateOne({ _id: uid }, {
+                    $set: {
+                        uid,
+                        paid: (Number(done && done.paid) || 0) + diff,
+                        at: new Date(),
+                        reason: '补签连续天数修正补发',
+                    },
+                }, { upsert: true });
+            }
+        }
+        users.push(row);
+    }
+
+    return {
+        dry, scanned, affected, totalCoins, totalPaid,
+        users: users.slice(0, 50),
+        usersTruncated: users.length > 50,
     };
 }
 

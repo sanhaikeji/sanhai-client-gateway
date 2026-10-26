@@ -12,12 +12,20 @@ import {
     init, doCheckin, getState, getCalendar, getRank, calcReward,
     issueToken, verifyToken, revokeTokens, listTokens,
     issuePairCode, consumePairCode, coinBalance, grantCoin, diagnose,
+    computeStreak, countBack, longestRun, loadCheckinDays, repairCheckin,
 } from './.build/model.ts';
 import { dateKey, today, prevDay, resolveRecordScope } from './.build/lib.ts';
 // 通知的两个 handler：这里跑的是**真实 handler 代码**（只把 import 路径改写成本机能跑的）
 import {
     NotificationsHandler, NotificationReadHandler,
 } from './.build/handler/system.ts';
+// 签到的三个 handler：RepairHandler 的权限门、补签文案、打卡联动能量都在这里跑真代码
+import {
+    CheckinDoHandler, CheckinStatusHandler, CheckinMakeupHandler, CheckinRepairHandler,
+} from './.build/handler/checkin.ts';
+import {
+    initPoints, grantCheckinPoints, pointsBalance, TASKS,
+} from './.build/points.ts';
 import {
     unreadFilter, readMark, isReadBy,
 } from './.build/notify.ts';
@@ -714,6 +722,256 @@ async function main() {
         eq('单个 id → scope="one"', rOne.scope, 'one');
         eq('单个 id 只清 1 条', rOne.updated, 1);
         eq('清完剩 1 条未读', (await get(F)).unread, 1);
+    }
+
+    // =============================================================================================
+    // 从这里起换成「线上配置」：makeupReward 1（补签不再纯亏）+ 打卡能量 100/10/200
+    //
+    // ⚠️ 上面那些段用的 CFG 是 makeupReward: 0 的老口径，**故意不动**它（历史断言原样保留）；
+    //    新语义只在生产默认值下说得通，所以单独 re-init 一次。
+    const CFG2 = {
+        ...CFG,
+        makeupReward: 1,
+        checkinPoints: 100, checkinPointsPerDay: 10, checkinPointsCap: 200,
+        checkinRepairCollection: 'clientgw.checkin_repair',
+        adminUids: [5],
+    };
+    init({ db } as any, CFG2);
+    initPoints({ db } as any, CFG2);
+
+    /** 相对今天往前数 k 天（k = 0 就是今天）。连签这类测试必须用真实「今天」才验得出来。 */
+    const D = (k: number) => dateKey(new Date(), -k);
+
+    /** 跑真 handler（绕过认证，认证另有测试）。 */
+    const callApi = async (Ctor: any, uid: number, params: any = {}) => {
+        const h: any = Object.create(Ctor.prototype);
+        h.clientUid = uid;
+        h.args = {};
+        h.request = { body: { ...params }, query: {}, headers: {}, ip: '127.0.0.1' };
+        h.response = {};
+        (h as any).ctx = { db };
+        await h.run();
+        return { ...(h.response.body || {}), _status: h.response.status };
+    };
+    const newUser = async (uid: number, coin = 0) => {
+        await db.collection('user').insertOne({
+            _id: uid, uname: `u${uid}`, coin_now: coin, coin_all: coin,
+        });
+    };
+
+    section('21. 补签把断掉的链接回来（用户原话的复现）★');
+    {
+        const U20 = 400;
+        await newUser(U20);
+        // 连 5 天：D-6 … D-2
+        for (let k = 6; k >= 2; k -= 1) await doCheckin(U20, { date: D(k) });
+        eq('连 5 天后第 5 天的 streak', (await getState(U20)).maxStreak, 5);
+
+        // 断 1 天（D-1）→ 今天签：必须从 1 重新算
+        const r1 = await doCheckin(U20, { date: D(0) });
+        eq('断 1 天后今天签 → streak 归 1', r1.streak, 1);
+        eq('断链后 state.streak 也诚实为 1（不是旧值 5）★', (await getState(U20)).streak, 1);
+
+        // 补签断的那一天
+        const mk = await doCheckin(U20, { date: D(1), makeup: true });
+        eq('补签日自己的连续数 = 6（不是「抄当前值」）', mk.streak, 6);
+        const st = await getState(U20);
+        eq('补签后立刻变 7 ★★', st.streak, 7);
+        eq('补签后 lastDate = 今天', st.lastDate, D(0));
+        eq('补签后 maxStreak = 7', st.maxStreak, 7);
+        eq('总天数 = 5 + 今天 + 补签', st.totalDays, 7);
+
+        // 用户看到的那个数字（/checkin/status）必须是 7 —— 原话「连续签到还是会重新计算」
+        const stApi = await callApi(CheckinStatusHandler, U20, {});
+        eq('接口 status.streak = 7 ★★', stApi.streak, 7);
+        eq('接口 status.signed = true', stApi.signed, true);
+        eq('接口 todayStreakIfSign = 7（今天已签）', stApi.todayStreakIfSign, 7);
+    }
+
+    section('22. 反向顺序：先补昨天、再签今天 ★');
+    {
+        const U21 = 401;
+        await newUser(U21);
+        for (let k = 5; k >= 2; k -= 1) await doCheckin(U21, { date: D(k) });   // D-5 … D-2（4 天）
+
+        const mk = await doCheckin(U21, { date: D(1), makeup: true });          // 先补昨天
+        eq('先补昨天：那天的连续数 = 5', mk.streak, 5);
+        eq('补完昨天：当前连续 5（昨天 = 链还活着）', (await getState(U21)).streak, 5);
+
+        const r = await doCheckin(U21, { date: D(0) });                         // 再签今天
+        eq('再签今天 → 6', r.streak, 6);
+        eq('state 同步到 6', (await getState(U21)).streak, 6);
+        eq('累计 6 天', (await getState(U21)).totalDays, 6);
+    }
+
+    section('23. 补签日按「该日连续数」拿奖励（含里程碑）★');
+    {
+        const U22 = 402;
+        await newUser(U22);
+        for (let k = 7; k >= 2; k -= 1) await doCheckin(U22, { date: D(k) });   // D-7 … D-2（6 天）
+
+        const mk = await doCheckin(U22, { date: D(1), makeup: true });          // 补第 7 天
+        eq('补签日的连续数 = 7', mk.streak, 7);
+        eq('补签日吃到「连续 7 天」里程碑 ★', mk.bonus, 5);
+        eq('补签日实发 = 基础 1 + 里程碑 5', mk.reward, 6);
+        eq('补签日的基础币不再是 0 ★', mk.base, 1);
+        eq('里程碑文案', mk.bonusLabel, '连续 7 天');
+
+        const row = await db.collection('clientgw.checkin_log').findOne({ uid: U22, date: D(1) });
+        eq('流水里记的 streak/reward 是终值（不是占位 0）',
+            [row.streak, row.reward, !!row.makeup], [7, 6, true]);
+    }
+
+    section('24. computeStreak：中间有洞 / 全是洞 / 只有今天 ★');
+    {
+        eq('countBack 纯函数（连 2 天）', countBack(new Set(['2026-01-01', '2026-01-02']), '2026-01-02'), 2);
+        eq('countBack 纯函数（upto 当天没签 → 0）', countBack(new Set(['2026-01-01']), '2026-01-02'), 0);
+        eq('longestRun 认最长的一段', longestRun(new Set(['2026-01-01', '2026-01-03', '2026-01-04'])), 2);
+
+        const ONLY_TODAY = 403;
+        await newUser(ONLY_TODAY);
+        await doCheckin(ONLY_TODAY, { date: D(0) });
+        eq('只有今天 → 1', await computeStreak(ONLY_TODAY, D(0)), 1);
+        eq('只有今天 → 问昨天是 0', await computeStreak(ONLY_TODAY, D(1)), 0);
+        eq('只有今天 → 问 D-3 是 0', await computeStreak(ONLY_TODAY, D(3)), 0);
+
+        const HOLE = 404;
+        await newUser(HOLE);
+        await doCheckin(HOLE, { date: D(0) });
+        await doCheckin(HOLE, { date: D(2) });                                  // D-1 留个洞
+        eq('中间有洞：今天数 1 天就停 ★', await computeStreak(HOLE, D(0)), 1);
+        eq('中间有洞：D-2 那天也是 1', await computeStreak(HOLE, D(2)), 1);
+        eq('中间有洞：D-3 没签 → 0', await computeStreak(HOLE, D(3)), 0);
+        eq('中间有洞：历史最长仍是 1', longestRun(await loadCheckinDays(HOLE)), 1);
+
+        const EMPTY = 405;
+        await newUser(EMPTY);
+        eq('全是洞（从没签过）→ 0', await computeStreak(EMPTY, D(0)), 0);
+        eq('全是洞 → 最多 0 天', longestRun(await loadCheckinDays(EMPTY)), 0);
+    }
+
+    section('25. 补发接口：dry / 真补 / 幂等 / force ★');
+    {
+        const U26 = 406;
+        await newUser(U26);
+        // 手工造一份「老 bug 留下的」流水：7 天连签全是 reward 0（线上就是这样少发的）
+        for (let k = 7; k >= 1; k -= 1) {
+            await db.collection('clientgw.checkin_log').insertOne({
+                uid: U26, date: D(k), ts: new Date(), streak: 1, reward: 0, makeup: k === 3,
+            });
+        }
+        // 应得：连 1..7 天 → 1+1+3+1+1+1+6 = 14（第 3 天 +2、第 7 天 +5）
+
+        // ---- 非管理员：403，且不能写任何东西
+        const deny = await callApi(CheckinRepairHandler, 7, { dry: '0', uid: U26 });
+        eq('非管理员 → 403 ★', deny._status, 403);
+        check('403 的提示是「只有管理员」', /只有管理员/.test(String(deny.error)), String(deny.error));
+        eq('403 之后余额没动', (await db.collection('user').findOne({ _id: U26 })).coin_now, 0);
+
+        // ---- 管理员：dry 默认 1
+        const adm = await callApi(CheckinRepairHandler, 5, { uid: U26 });
+        eq('管理员不传 dry → 默认 dry=1 ★', adm.dry, true);
+        eq('体检报出 1 个人', adm.scanned, 1);
+        eq('体检报出 1 个有差额', adm.affected, 1);
+        eq('体检报出应补 14', adm.totalCoins, 14);
+        eq('体检的明细路径对', [adm.users[0].uid, adm.users[0].days, adm.users[0].endStreak],
+            [U26, 7, 7]);
+        eq('体检时 paid=0', adm.users[0].paid, 0);
+
+        // ---- dry=1（模型层，再确认一遍真的不写库）
+        const rep1 = await repairCheckin({ dry: true, uid: U26 });
+        eq('dry：expected 14', rep1.users[0].expected, 14);
+        eq('dry：actual 0', rep1.users[0].actual, 0);
+        eq('dry：diff 14', rep1.users[0].diff, 14);
+        eq('dry：totalPaid 0', rep1.totalPaid, 0);
+        eq('dry 不写库：余额还是 0 ★', (await db.collection('user').findOne({ _id: U26 })).coin_now, 0);
+        eq('dry 不写库：没建 state 文档 ★',
+            await db.collection('clientgw.checkin').findOne({ _id: U26 }), null);
+        eq('dry 不写库：没建补发记录 ★',
+            await db.collection('clientgw.checkin_repair').countDocuments({ _id: U26 }), 0);
+        eq('dry 不写库：没写账单 ★',
+            (await db.collection('coin').find({ userId: U26 }).toArray()).length, 0);
+
+        // ---- dry=0：真补
+        const rep2 = await repairCheckin({ dry: false, uid: U26 });
+        eq('真补：paid = 14', rep2.users[0].paid, 14);
+        eq('真补：totalPaid = 14', rep2.totalPaid, 14);
+        const u26 = await db.collection('user').findOne({ _id: U26 });
+        eq('真补：余额 +14 ★', u26.coin_now, 14);
+        eq('真补：coin_all 也涨（硬币榜靠它筛人）★', u26.coin_all, 14);
+        const bills26 = await db.collection('coin').find({ userId: U26 }).toArray();
+        eq('真补：只写 1 张账单', bills26.length, 1);
+        eq('真补：账单文案', bills26[0].text, '补签连续天数修正补发');
+
+        const st26 = await db.collection('clientgw.checkin').findOne({ _id: U26 });
+        eq('state.totalDays = 流水条数 ★', st26.totalDays, 7);
+        eq('state.totalReward 按流水重算 = 14 ★', st26.totalReward, 14);
+        eq('state.maxStreak = 最长一段 = 7', st26.maxStreak, 7);
+        eq('state.streak = 7（最后签到日是昨天，链还活着）', st26.streak, 7);
+        eq('state.lastDate = 昨天', st26.lastDate, D(1));
+
+        // ---- 再跑一次：不二次补
+        const rep3 = await repairCheckin({ dry: false, uid: U26 });
+        eq('重复跑：paid = 0 ★★', rep3.users[0].paid, 0);
+        eq('重复跑：totalPaid = 0', rep3.totalPaid, 0);
+        eq('重复跑：余额不变 ★', (await db.collection('user').findOne({ _id: U26 })).coin_now, 14);
+        eq('重复跑：账单没多', (await db.collection('coin').find({ userId: U26 }).toArray()).length, 1);
+        eq('重复跑：仍报出同一处差额（诊断信息不丢）', rep3.users[0].diff, 14);
+
+        // ---- force=1 才再补
+        const rep4 = await repairCheckin({ dry: false, uid: U26, force: true });
+        eq('force=1 才再补一次 ★', rep4.users[0].paid, 14);
+        eq('force 后余额 28', (await db.collection('user').findOne({ _id: U26 })).coin_now, 28);
+        const rep5 = await db.collection('clientgw.checkin_repair').findOne({ _id: U26 });
+        eq('补发记录记着累计 28', rep5.paid, 28);
+    }
+
+    section('26. 打卡能量：100 / 140 / 300 + 一天只发一次 ★');
+    {
+        const P1 = 410; const P5 = 411; const P30 = 412; const P50 = 413; const P0 = 414;
+        for (const u of [P1, P5, P30, P50, P0]) await newUser(u);
+
+        eq('连签 1 天 → 100 ★', (await grantCheckinPoints(P1, 1)).points, 100);
+        eq('连签 5 天 → 140 ★', (await grantCheckinPoints(P5, 5)).points, 140);
+        eq('连签 30 天 → 300（封顶）★', (await grantCheckinPoints(P30, 30)).points, 300);
+        eq('连签 50 天也还是 300（封顶只压加成）', (await grantCheckinPoints(P50, 50)).points, 300);
+        eq('streak=0 只给基础 100', (await grantCheckinPoints(P0, 0)).points, 100);
+
+        // 同一天重复发：幂等键 checkin:<uid>:<日期> 挡住
+        const dup = await grantCheckinPoints(P1, 1);
+        eq('同一天再发 → 0 分 ★★', dup.points, 0);
+        eq('同日重复后余额仍是 100', await pointsBalance(P1), 100);
+        eq('积分流水只 1 条',
+            await db.collection('clientgw.points_log').countDocuments({ uid: P1 }), 1);
+    }
+
+    section('27. 打卡接口联动：能量 + 补签文案 ★');
+    {
+        const C1 = 420;
+        await newUser(C1);
+        const d1 = await callApi(CheckinDoHandler, C1, {});
+        eq('打卡顺手发能量 100 ★', d1.points, 100);
+        eq('打卡返回 streak = 1', d1.streak, 1);
+        eq('status.streak = 1', d1.status.streak, 1);
+        eq('status.signed = true', d1.status.signed, true);
+
+        const d2 = await callApi(CheckinDoHandler, C1, {});
+        eq('重复打卡 already', d2.already, true);
+        eq('重复打卡不再给能量 ★', d2.points, 0);
+        eq('重复打卡 streak 仍是 1（不是 0）', d2.streak, 1);
+
+        // 补签文案要把实发硬币数说出来，否则「花 5 币」看着像纯亏
+        const C2 = 421;
+        await newUser(C2, 10);
+        await doCheckin(C2, { date: D(2) });
+        const mk = await callApi(CheckinMakeupHandler, C2, { date: D(1) });
+        eq('补签成功', mk.ok, true);
+        eq('补签成本 5', mk.cost, 5);
+        eq('补签也发基础币（不再纯亏）★', mk.reward, 1);
+        check('补签文案带实发硬币数 ★', /获得 1 硬币/.test(String(mk.message)), String(mk.message));
+
+        // 任务表里的「完成今日打卡」是另一笔，改成 20
+        eq('任务表 daily.checkin = 20 分 ★', TASKS.find((t) => t.id === 'daily.checkin')?.points, 20);
     }
 
     console.log(`\n${'='.repeat(46)}`);

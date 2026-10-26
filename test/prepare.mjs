@@ -41,6 +41,13 @@ if (!m.includes("./_hydro.ts")) {
 }
 writeFileSync(join(OUT, 'model.ts'), m);
 
+// points.ts：积分 / 任务 / 打卡能量（新加的积分数值要能单独测）
+let p = readFileSync(join(SRC, 'points.ts'), 'utf8');
+p = p.replaceAll("from 'hydrooj'", "from './_hydro.ts'");
+p = p.replaceAll("from './model'", "from './model.ts'");
+p = p.replaceAll("from './lib'", "from './lib.ts'");
+writeFileSync(join(OUT, 'points.ts'), p);
+
 // hydrooj 替身：只提供源码真正用到的值（签到流程本身不依赖它）
 writeFileSync(join(OUT, '_hydro.ts'), [
     '/** 服务器上是真 hydrooj；本机测试只要 import 成立即可。 */',
@@ -55,14 +62,16 @@ writeFileSync(join(OUT, '_hydro.ts'), [
     '',
 ].join('\n'));
 
-// handler 层：只搬通知相关的三个文件（base / coin / system），供 test.ts 直接跑
-// **真实的 handler 代码路径** —— 查询条件对不对、返回体对不对，都在这里验。
+// handler 层：搬通知 / 硬币 / 签到三个文件，供 test.ts 直接跑
+// **真实的 handler 代码路径** —— 查询条件对不对、返回体对不对、权限门在不在，都在这里验。
 mkdirSync(join(OUT, 'handler'), { recursive: true });
-for (const f of ['base.ts', 'coin.ts', 'system.ts']) {
+for (const f of ['base.ts', 'coin.ts', 'system.ts', 'checkin.ts']) {
     let code = readFileSync(join(SRC, 'handler', f), 'utf8');
     code = code.replaceAll("from 'hydrooj'", "from '../_hydro.ts'");
     for (const dep of ['base', 'coin']) code = code.replaceAll(`from './${dep}'`, `from './${dep}.ts'`);
-    for (const dep of ['model', 'lib', 'notify']) code = code.replaceAll(`from '../${dep}'`, `from '../${dep}.ts'`);
+    for (const dep of ['model', 'lib', 'notify', 'points']) {
+        code = code.replaceAll(`from '../${dep}'`, `from '../${dep}.ts'`);
+    }
     writeFileSync(join(OUT, 'handler', f), code);
 }
 

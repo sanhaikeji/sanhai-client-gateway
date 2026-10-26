@@ -17,7 +17,7 @@
  *   发了必然被刷。</p>
  */
 import { ObjectId } from 'hydrooj';
-import { getState } from './model';
+import { getState, getConfig } from './model';
 import { today } from './lib';
 
 let _ctx: any;
@@ -148,7 +148,7 @@ export const TASKS: TaskDef[] = [
         id: 'daily.checkin',
         title: '完成今日打卡',
         desc: '打卡时同时拿站点硬币和客户端积分',
-        points: 5,
+        points: 20,
         period: 'daily',
         check: async (_ctx, uid) => (await getState(uid)).lastDate === today(),
     },
@@ -247,11 +247,24 @@ export async function claimTask(ctx: any, uid: number, taskId: string) {
 /**
  * 打卡时同步发积分（和硬币同时）。
  * 幂等键用 `checkin:<uid>:<日期>`，所以**一天只发一次**，并发也安全。
+ *
+ * <p>数值全部可配：第 1 天 `checkinPoints`（默认 100），之后每天加
+ * `checkinPointsPerDay`（默认 10），加成封顶 `checkinPointsCap`（默认 200）——
+ * 即第 5 天 140、第 30 天封顶 300。原来的 `5 + min((streak-1)*2, 20)` 太小，
+ * 打卡在界面上几乎没有存在感。</p>
+ *
+ * <p>⚠️ `streak` 是**那一天真实的连续天数**（来自流水推导，见 model.ts 的
+ * `computeStreak`），不是 state 里可能过期的缓存值。</p>
  */
 export async function grantCheckinPoints(uid: number, streak: number): Promise<{ points: number; balance: number }> {
-    // 连续签到有加成：连得越久给得越多（上限封顶，别让连签变成印钞机）
-    const bonus = Math.min(Math.max(0, streak - 1) * 2, 20);
-    const pts = 5 + bonus;
+    const cfg: any = getConfig();
+    const base = Number(cfg.checkinPoints ?? 100);
+    const perDay = Number(cfg.checkinPointsPerDay ?? 10);
+    const cap = Number(cfg.checkinPointsCap ?? 200);
+    // 封顶只压在「连续加成」上，基础分照给 —— 否则连签 30 天和 20 天就没区别了
+    const bonus = Math.min(Math.max(0, streak - 1) * perDay, cap);
+    const pts = base + bonus;
+    // 幂等键保持不变（checkin:<uid>:<日期>）—— 一天只发一次，重复打卡拿不到第二份
     const r = await addPoints(uid, pts, `每日打卡（连续 ${streak} 天${bonus ? `，加成 +${bonus}` : ''}）`, 0, `checkin:${uid}:${today()}`);
     return { points: r.duplicated ? 0 : pts, balance: r.balance };
 }
