@@ -912,13 +912,19 @@ async function main() {
         eq('state.streak = 7（最后签到日是昨天，链还活着）', st26.streak, 7);
         eq('state.lastDate = 昨天', st26.lastDate, D(1));
 
-        // ---- 再跑一次：不二次补
+        // ---- 再跑一次：不二次补，而且报告要**收敛**（补完了就该显示 0）
         const rep3 = await repairCheckin({ dry: false, uid: U26 });
-        eq('重复跑：paid = 0 ★★', rep3.users[0].paid, 0);
+        eq('重复跑：没有人还欠钱 ★★', rep3.affected, 0);
         eq('重复跑：totalPaid = 0', rep3.totalPaid, 0);
         eq('重复跑：余额不变 ★', (await db.collection('user').findOne({ _id: U26 })).coin_now, 14);
         eq('重复跑：账单没多', (await db.collection('coin').find({ userId: U26 }).toArray()).length, 1);
-        eq('重复跑：仍报出同一处差额（诊断信息不丢）', rep3.users[0].diff, 14);
+
+        // ⚠️ 2026-10-31 线上真踩到：补完 29 币后再 dry=1，照样报「4 人 29 币」，
+        //    管理员会以为没生效，手滑加 force=1 就二次发钱。差额必须减掉已补部分。
+        const rep3b = await repairCheckin({ dry: true, uid: U26 });
+        eq('★ 补完之后体检收敛：affected = 0', rep3b.affected, 0);
+        eq('★ 补完之后体检收敛：totalCoins = 0', rep3b.totalCoins, 0);
+        eq('★ 收敛后 users 为空（不再报同一个差）', rep3b.users.length, 0);
 
         // ---- force=1 才再补
         const rep4 = await repairCheckin({ dry: false, uid: U26, force: true });

@@ -479,8 +479,15 @@ export async function repairCheckin(
             expected += calcReward(countBack(days, r.date), !!r.makeup).total;
             actual += Number(r.reward || 0);
         }
-        const diff = expected - actual;
-        if (diff <= 0) continue;   // 没差额 = 不用动
+
+        // ⚠️ 已经补过的金额必须扣掉，否则「补完了再体检」还是报同样的差额 ——
+        //    2026-10-31 线上真踩到：补完 29 币后再跑 dry=1，照样显示 4 人 29 币，
+        //    管理员会以为没生效；这时候手滑加个 force=1 就变成二次发钱。
+        //    force 的语义是「无视已补记录、再发一次」，所以它才回到「只和实发比」。
+        const done = await repairColl.findOne({ _id: uid }).catch(() => null);
+        const paidBefore = Number(done && done.paid) || 0;
+        const diff = force ? (expected - actual) : (expected - actual - paidBefore);
+        if (diff <= 0) continue;   // 没有还欠的 = 不用动
 
         affected += 1;
         totalCoins += diff;
@@ -506,7 +513,6 @@ export async function repairCheckin(
             }, { upsert: true });
 
             // (b) 发钱：一个 uid 只补一次，force=1 才允许重来
-            const done = await repairColl.findOne({ _id: uid });
             if (!done || force) {
                 await grantCoin(uid, diff, '补签连续天数修正补发');
                 row.paid = diff;
@@ -514,7 +520,7 @@ export async function repairCheckin(
                 await repairColl.updateOne({ _id: uid }, {
                     $set: {
                         uid,
-                        paid: (Number(done && done.paid) || 0) + diff,
+                        paid: paidBefore + diff,
                         at: new Date(),
                         reason: '补签连续天数修正补发',
                     },
