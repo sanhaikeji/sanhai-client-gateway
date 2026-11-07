@@ -20,6 +20,7 @@ import { Context, PRIV, Schema } from 'hydrooj';
 import * as H from './handler';
 import { init as initModel, diagnose } from './model';
 import { initPoints } from './points';
+import { registerRelayRoute } from './handler/relay';
 
 /** 配置默认值。与下面的 Schema 保持一致（Hydro 传进来的 config 可能缺字段，这里兜底）。 */
 const DEFAULTS = {
@@ -123,8 +124,10 @@ export async function apply(ctx: Context, config: any = {}) {
 
     /** 注册一个路由。参数不传 = 不检查权限（认证在 ClientApiHandler 里自己做）。 */
     const R = (name: string, path: string, Handler: any, priv?: number) => {
-        if (priv === undefined) ctx.Route(name, path, Handler);
-        else ctx.Route(name, path, Handler, priv);
+        // ⚠️ 走 registerRelayRoute 而不是直接 ctx.Route：
+        //    它会顺带把 handler 记进转发表（handler/relay.ts 的 HANDLER_MAP），
+        //    心跳中转的代发接口要靠那张表找到对应 handler。
+        registerRelayRoute(ctx, name, path, Handler, priv);
     };
 
     // ---------------- 系统
@@ -196,6 +199,15 @@ export async function apply(ctx: Context, config: any = {}) {
     // 任务中心
     R('client_api_tasks', '/client-api/tasks', H.TaskListHandler);
     R('client_api_tasks_claim', '/client-api/tasks/claim', H.TaskClaimHandler);
+
+    // ---------------- 心跳中转（2026-11-07）
+    // 学校禁止内网穿透后的替代链路：客户端/agent 主动外连云服务，
+    // 由本插件验用户令牌并代发。详见 site3/HEARTBEAT-RELAY-DESIGN.md。
+    //
+    // ⚠️ 这一条**不进转发表**（用 ctx.Route 而不是 R）：
+    //    它是「代发的入口」，本身不能被代发 —— 否则就多了一层无意义的转发环，
+    //    而且那个环会绕过限流。
+    ctx.Route('client_api_relay_forward', '/client-api/relay/forward', H.RelayForwardHandler);
 
     ctx.logger?.info?.('[clientgw] 客户端通道已就绪：/client-api/*');
 

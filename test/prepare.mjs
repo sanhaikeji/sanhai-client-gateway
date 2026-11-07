@@ -74,13 +74,13 @@ writeFileSync(join(OUT, '_hydro.ts'), [
     '',
 ].join('\n'));
 
-// handler 层：搬通知 / 硬币 / 签到 / 题目，供 test.ts 直接跑
+// handler 层：搬通知 / 硬币 / 签到 / 题目 / 中转，供 test.ts 直接跑
 // **真实的 handler 代码路径** —— 查询条件对不对、返回体对不对、权限门在不在，都在这里验。
 mkdirSync(join(OUT, 'handler'), { recursive: true });
-for (const f of ['base.ts', 'coin.ts', 'system.ts', 'checkin.ts', 'oj.ts']) {
+for (const f of ['base.ts', 'coin.ts', 'system.ts', 'checkin.ts', 'oj.ts', 'relay.ts']) {
     let code = readFileSync(join(SRC, 'handler', f), 'utf8');
     code = code.replaceAll("from 'hydrooj'", "from '../_hydro.ts'");
-    for (const dep of ['base', 'coin']) code = code.replaceAll(`from './${dep}'`, `from './${dep}.ts'`);
+    for (const dep of ['base', 'coin', 'relay']) code = code.replaceAll(`from './${dep}'`, `from './${dep}.ts'`);
     for (const dep of ['model', 'lib', 'notify', 'points']) {
         code = code.replaceAll(`from '../${dep}'`, `from '../${dep}.ts'`);
     }

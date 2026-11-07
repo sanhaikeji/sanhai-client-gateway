@@ -7,3 +7,4 @@ export * from './oj';
 export * from './coin';
 export * from './points';
 export * from './system';
+export * from './relay';

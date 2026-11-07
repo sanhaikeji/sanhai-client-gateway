@@ -45,7 +45,12 @@ export abstract class ClientApiHandler extends Handler {
 
     async _prepare() { await this.doAuth(); }
 
-    private _authed = false;
+    /**
+     * 认证是否已经做过。
+     * <para>⚠️ 改成 protected 是给「代发」用的（handler/relay.ts）：代发时身份是
+     * **被代发用户的 uid**，不能再去验「谁在发」—— 那会把通道密钥当用户令牌去验。</para>
+     */
+    protected _authed = false;
 
     private async doAuth() {
         if (this._authed) return;
@@ -118,6 +123,16 @@ export abstract class ClientApiHandler extends Handler {
         this.json(200, { ok: true, ...data });
     }
 
+    /**
+     * 带指定状态码的成功响应。
+     * <para>⚠️ 为什么要它：<c>ok()</c> 硬编码 200，而「代发」场景需要**透传**被代发接口的
+     * 状态码（它回 404 就得回 404）。直接 <c>this.response.status = x</c> 再调 <c>ok()</c>
+     * 会被 <c>ok()</c> 里的 200 覆盖掉 —— 这个坑很难查（响应体对、状态码错）。</para>
+     */
+    protected okWithStatus(status: number, data: any = {}) {
+        this.json(status, { ok: true, ...data });
+    }
+
     protected fail(message: string, status = 400, extra: any = {}) {
         this.json(status, { ok: false, error: message, ...extra });
     }
@@ -150,7 +165,12 @@ export abstract class ClientApiHandler extends Handler {
 
     async post() { await this.dispatch(); }
 
-    private async dispatch() {
+    /**
+     * 分发到 run()。
+     * <para>⚠️ 改成 protected 是给「代发」用的（handler/relay.ts）：
+     * 代发时要直接调被代发接口的 run()，不能走 HTTP 那条路。</para>
+     */
+    protected async dispatch() {
         if (this.requiresAuth && !this.clientUid) return;   // prepare 已写错误响应
         try {
             await this.run();
